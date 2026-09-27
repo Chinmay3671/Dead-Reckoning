@@ -59,16 +59,16 @@ export const DeadReckoningEngine = {
 
   /**
    * Zero Velocity Update (ZUPT) Filter Algorithm:
-   * Suppresses integration drift when vehicle is stationary (|a| < 0.25 m/s² for > 0.5 sec)
+   * Suppresses integration drift when vehicle is stationary (|a| < 0.4 m/s² for > 0.3 sec)
    */
   checkZuptStationary(accelMS2: number, deltaTimeSec: number): boolean {
     const absAccel = Math.abs(accelMS2);
-    if (absAccel < 0.25) {
+    if (absAccel < 0.4) {
       zuptStationaryDurationSec += deltaTimeSec;
     } else {
       zuptStationaryDurationSec = 0;
     }
-    return zuptStationaryDurationSec >= 0.5;
+    return zuptStationaryDurationSec >= 0.3;
   },
 
   /**
@@ -90,24 +90,29 @@ export const DeadReckoningEngine = {
     deltaTimeSec: number,
     accumulatedDrift: number
   ): DRPositionEstimate {
-    const isStationary = DeadReckoningEngine.checkZuptStationary(accelMS2, deltaTimeSec);
+    const isStationary =
+      currentSpeedKmH < 1.0 ||
+      DeadReckoningEngine.checkZuptStationary(accelMS2, deltaTimeSec);
 
     // Convert speed to m/s
     const speedMS = isStationary ? 0 : (currentSpeedKmH * 1000) / 3600;
     const newSpeedMS = isStationary ? 0 : Math.max(0, speedMS + accelMS2 * deltaTimeSec);
     const newSpeedKmH = (newSpeedMS * 3600) / 1000;
 
-    // Calculate displacement in meters
-    const distMeters = newSpeedMS * deltaTimeSec;
+    // Calculate displacement in meters (strictly zero when stationary)
+    const distMeters = isStationary ? 0 : newSpeedMS * deltaTimeSec;
 
     // Convert bearing to radians
     const headingRad = (headingDeg * Math.PI) / 180;
 
     // Convert meter offset to lat/lng degrees (WGS84 spherical approximation for local step)
-    const deltaLat = (distMeters * Math.cos(headingRad)) / 111111;
+    const deltaLat =
+      distMeters > 0 ? (distMeters * Math.cos(headingRad)) / 111111 : 0;
     const deltaLng =
-      (distMeters * Math.sin(headingRad)) /
-      (111111 * Math.cos((prevPos[0] * Math.PI) / 180));
+      distMeters > 0
+        ? (distMeters * Math.sin(headingRad)) /
+          (111111 * Math.cos((prevPos[0] * Math.PI) / 180))
+        : 0;
 
     const newPos: [number, number] = [
       prevPos[0] + deltaLat,

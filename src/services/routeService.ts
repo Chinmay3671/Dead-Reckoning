@@ -47,9 +47,7 @@ export class RouteService {
     const isOnline = typeof navigator !== 'undefined' ? navigator.onLine : true;
 
     if (!isOnline) {
-      throw new Error(
-        `Route unavailable while offline. (Straight-line distance: ${straightDistKm.toFixed(1)} km)`
-      );
+      return this.generateOfflineApproximateRoute(origin, destination, vehicleProfile, requestId);
     }
 
     // 2. Profile-Aware Route Cache Check
@@ -62,20 +60,26 @@ export class RouteService {
       };
     }
 
-    // 3. Dispatch to profile-specific calculation methods
+    // 3. Dispatch to profile-specific calculation methods with graceful offline corridor fallback
     let result: NormalizedRouteResult;
-    switch (vehicleProfile) {
-      case 'car':
-        result = await this.calculateCarRoute(origin, destination, alternatives, signal, requestId, straightDistKm);
-        break;
-      case 'bike':
-        result = await this.calculateBikeRoute(origin, destination, alternatives, signal, requestId, straightDistKm);
-        break;
-      case 'walking':
-        result = await this.calculateWalkingRoute(origin, destination, alternatives, signal, requestId, straightDistKm);
-        break;
-      default:
-        result = await this.calculateCarRoute(origin, destination, alternatives, signal, requestId, straightDistKm);
+    try {
+      switch (vehicleProfile) {
+        case 'car':
+          result = await this.calculateCarRoute(origin, destination, alternatives, signal, requestId, straightDistKm);
+          break;
+        case 'bike':
+          result = await this.calculateBikeRoute(origin, destination, alternatives, signal, requestId, straightDistKm);
+          break;
+        case 'walking':
+          result = await this.calculateWalkingRoute(origin, destination, alternatives, signal, requestId, straightDistKm);
+          break;
+        default:
+          result = await this.calculateCarRoute(origin, destination, alternatives, signal, requestId, straightDistKm);
+      }
+    } catch (err: any) {
+      if (err.name === 'AbortError') throw err;
+      // If network fails during request, smoothly fall back to offline DR corridor
+      result = this.generateOfflineApproximateRoute(origin, destination, vehicleProfile, requestId);
     }
 
     // 4. Save to cache
@@ -417,6 +421,87 @@ export class RouteService {
       lng <= 180 &&
       (lat !== 0 || lng !== 0)
     );
+  }
+
+  /**
+   * Generates a Dead-Reckoning navigation corridor when offline / OSRM is unreachable
+   */
+  public static generateOfflineApproximateRoute(
+    origin: [number, number],
+    destination: [number, number],
+    vehicleProfile: VehicleType = 'car',
+    requestId: number = 0
+  ): NormalizedRouteResult {
+    const [startLat, startLng] = origin;
+    const [destLat, destLng] = destination;
+    const straightDistKm = DeadReckoningEngine.calculateHaversineDistance(origin, destination);
+    const speedKmH = vehicleProfile === 'walking' ? 4.8 : vehicleProfile === 'bike' ? 18 : 50;
+    const durationSeconds = Math.max(60, Math.round((straightDistKm / speedKmH) * 3600));
+    const durationMin = Math.max(1, Math.round(durationSeconds / 60));
+
+    // Interpolate intermediate waypoints along the direct vector for visual corridor guidance
+    const coordinates: [number, number][] = [];
+    const numPoints = 12;
+    for (let i = 0; i <= numPoints; i++) {
+      const frac = i / numPoints;
+      coordinates.push([
+        startLat + (destLat - startLat) * frac,
+        startLng + (destLng - startLng) * frac,
+      ]);
+    }
+
+    const steps: RouteStep[] = [
+      {
+        maneuverType: 'depart',
+        name: 'Dead-Reckoning Corridor',
+        distanceMeters: Math.round(straightDistKm * 1000),
+        durationSec: durationSeconds,
+        instruction: `Follow Dead-Reckoning Corridor directly to destination (${straightDistKm.toFixed(1)} km)`,
+      },
+      {
+        maneuverType: 'arrive',
+        name: 'Destination',
+        distanceMeters: 0,
+        durationSec: 0,
+        instruction: 'Arrive at destination',
+      },
+    ];
+
+    const routeOption: RouteOption = {
+      id: `offline-route-${vehicleProfile}-${Date.now()}`,
+      index: 0,
+      coordinates,
+      distanceKm: Math.round(straightDistKm * 10) / 10,
+      durationMin,
+      label: 'Recommended',
+      summary: 'Offline Dead-Reckoning Corridor',
+      routeType: 'Offline Route',
+      steps,
+    };
+
+    return {
+      vehicleProfile,
+      distanceMeters: Math.round(straightDistKm * 1000),
+      durationSeconds,
+      distanceKm: Math.round(straightDistKm * 10) / 10,
+      durationMin,
+      geometry: coordinates,
+      steps,
+      alternatives: [],
+      selectedRoute: routeOption,
+      routes: [routeOption],
+      summary: 'Offline Dead-Reckoning Corridor',
+      source: 'Offline ReckonX Engine',
+      providerUrl: 'local:offline',
+      requestId,
+      profileLabel:
+        vehicleProfile === 'walking'
+          ? '🚶 Walking (Offline)'
+          : vehicleProfile === 'bike'
+          ? '🚲 Bike (Offline)'
+          : '🚗 Car (Offline)',
+      routeTypeLabel: 'Offline Navigation Corridor',
+    };
   }
 
   /**

@@ -102,6 +102,17 @@ export class RateLimiter {
       return { output: input };
     }
 
+    // GNSS Reacquisition Detection: When signal returns from WEAK_LOST/DEGRADED to GOOD,
+    // allow the state re-anchor without falsely treating the dead-reckoning offset as a vehicle speed jump
+    const isReacquisition =
+      (previousAccepted.gnssState === 'WEAK_LOST' || previousAccepted.gnssState === 'DEGRADED') &&
+      input.gnssState === 'GOOD';
+
+    if (isReacquisition) {
+      this.lastSpeed = 0;
+      return { output: input };
+    }
+
     const dt = (input.timestamp - previousAccepted.timestamp) / 1000.0;
     if (dt <= 0) return { output: input }; // Should not happen in causal processing
 
@@ -172,12 +183,14 @@ export class CvKalmanSmoother {
   private Q_vel: number;
   private lastTime: number = 0;
   private isInitialized = false;
+  private lastGnssState: string = 'GOOD';
+  private reacquisitionBlendCountdown: number = 0;
 
-  constructor(qPos: number = 1e-9, qVel: number = 1e-5) {
+  constructor(qPos: number = 1e-8, qVel: number = 1e-6) {
     this.Q_pos = qPos;
     this.Q_vel = qVel;
     this.x = Matrix.zeros(4, 1);
-    this.P = Matrix.eye(4).mul(100);
+    this.P = Matrix.eye(4).mul(1e-6);
   }
 
   public filter(input: StabilizerInput): StabilizedOutput {
@@ -190,6 +203,7 @@ export class CvKalmanSmoother {
       this.P = Matrix.eye(4).mul(1e-9);
       this.lastTime = input.timestamp;
       this.isInitialized = true;
+      this.lastGnssState = input.gnssState;
       return { lat: input.lat, lon: input.lon, wasClamped: false, wasSmoothed: false };
     }
 
@@ -204,14 +218,30 @@ export class CvKalmanSmoother {
     }
     this.lastTime = input.timestamp;
 
+    // Detect GNSS reacquisition transition
+    if (
+      (this.lastGnssState === 'WEAK_LOST' || this.lastGnssState === 'DEGRADED') &&
+      input.gnssState === 'GOOD'
+    ) {
+      this.reacquisitionBlendCountdown = 12; // 1.2s smooth blending window (12 steps @ 10Hz)
+    }
+    this.lastGnssState = input.gnssState;
+
     // 1. Predict
     const F = Matrix.eye(4);
     F.set(0, 2, dt);
     F.set(1, 3, dt);
 
+    let effectiveQPos = this.Q_pos;
+    if (this.reacquisitionBlendCountdown > 0) {
+      // Inflate process covariance during reacquisition to rapidly and smoothly glide to GPS fix
+      effectiveQPos = 1e-6;
+      this.reacquisitionBlendCountdown--;
+    }
+
     const Q = Matrix.zeros(4, 4);
-    Q.set(0, 0, this.Q_pos * dt);
-    Q.set(1, 1, this.Q_pos * dt);
+    Q.set(0, 0, effectiveQPos * dt);
+    Q.set(1, 1, effectiveQPos * dt);
     Q.set(2, 2, this.Q_vel * dt);
     Q.set(3, 3, this.Q_vel * dt);
 
@@ -226,9 +256,11 @@ export class CvKalmanSmoother {
 
     // R scaling
     // ~0.2m variance for GOOD -> ~1e-11 deg^2
-    let baseR = 1e-10;
-    if (input.gnssState === 'DEGRADED' || input.gnssState === 'WEAK_LOST') {
-      baseR = 1e-8; // 100x looser when degraded
+    let baseR = 1e-11;
+    if (input.gnssState === 'DEGRADED') {
+      baseR = 1e-10;
+    } else if (input.gnssState === 'WEAK_LOST') {
+      baseR = 1e-11; // In WEAK_LOST / dead-reckoning mode, track EKF INS state directly
     }
 
     // Apply ekfConfidence if provided

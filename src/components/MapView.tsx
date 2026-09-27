@@ -109,11 +109,15 @@ const IndexedDBTileLayer = L.TileLayer.extend({
     tile.setAttribute('role', 'presentation');
 
     const url = this.getTileUrl(coords);
+    const isOnline = typeof navigator !== 'undefined' ? navigator.onLine : true;
 
     // Fetch from IndexedDB cache or network
     TileCacheService.getTile(url).then((cachedDataUrl) => {
       if (cachedDataUrl) {
         tile.src = cachedDataUrl;
+      } else if (!isOnline) {
+        // When offline, immediately serve placeholder tile without firing failed fetch requests
+        tile.src = TileCacheService.getPlaceholderTile();
       } else {
         fetch(url)
           .then((res) => {
@@ -195,6 +199,9 @@ const MapViewComponent: React.FC<MapViewProps> = ({
   const mapInstanceRef = useRef<L.Map | null>(null);
   const routeLayerGroupRef = useRef<L.LayerGroup | null>(null);
   const markerLayerGroupRef = useRef<L.LayerGroup | null>(null);
+  const pathLayerGroupRef = useRef<L.LayerGroup | null>(null);
+  const drPolylineRef = useRef<L.Polyline | null>(null);
+  const insPolylineRef = useRef<L.Polyline | null>(null);
   const vehicleMarkerRef = useRef<L.Marker | null>(null);
   const vehicleTypeRef = useRef<VehicleType>(vehicleType);
   const isProgrammaticMoveRef = useRef<boolean>(false);
@@ -275,8 +282,10 @@ const MapViewComponent: React.FC<MapViewProps> = ({
 
     const routeGroup = L.layerGroup().addTo(map);
     const markerGroup = L.layerGroup().addTo(map);
+    const pathGroup = L.layerGroup().addTo(map);
     routeLayerGroupRef.current = routeGroup;
     markerLayerGroupRef.current = markerGroup;
+    pathLayerGroupRef.current = pathGroup;
     mapInstanceRef.current = map;
 
     // Detect user manual interaction (drag, zoom, pan) to immediately deactivate follow mode
@@ -346,10 +355,11 @@ const MapViewComponent: React.FC<MapViewProps> = ({
     };
   }, [onMapClick]);
 
-  // 60 FPS Visual Interpolation Loop for Vehicle Marker & Optional Camera Follow
+  // 60 FPS Visual Interpolation Loop for Vehicle Marker & Smooth Camera Follow
   useEffect(() => {
     let animId: number;
     let lastTime = performance.now();
+    let lastCameraPanTime = 0;
 
     const tick = (now: number) => {
       const dt = Math.min((now - lastTime) / 1000, 0.1);
@@ -364,15 +374,15 @@ const MapViewComponent: React.FC<MapViewProps> = ({
         if (!visualPosRef.current) {
           visualPosRef.current = [targetPos[0], targetPos[1]];
         } else {
-          // Smooth exponential LERP factor for position
-          const factor = Math.min(1, dt * 10);
+          // Smooth exponential LERP factor for position (12 Hz response for ultra-fluid movement)
+          const factor = Math.min(1, dt * 12);
           visualPosRef.current[0] += (targetPos[0] - visualPosRef.current[0]) * factor;
           visualPosRef.current[1] += (targetPos[1] - visualPosRef.current[1]) * factor;
         }
 
         // Shortest-path angular heading LERP
         const diff = ((targetHeading - visualHeadingRef.current + 540) % 360) - 180;
-        visualHeadingRef.current += diff * Math.min(1, dt * 12);
+        visualHeadingRef.current += diff * Math.min(1, dt * 14);
 
         const vPos: [number, number] = [visualPosRef.current[0], visualPosRef.current[1]];
         const vHead = visualHeadingRef.current;
@@ -383,7 +393,7 @@ const MapViewComponent: React.FC<MapViewProps> = ({
           const el = marker.getElement();
           const arrow = el?.querySelector('.chevron-arrow') as HTMLElement;
           if (arrow) {
-            arrow.style.transform = `rotate(${vHead}deg)`;
+            arrow.style.transform = `translate3d(0, 0, 0) rotate(${vHead}deg)`;
           }
         } else if (markerLayerGroupRef.current) {
           const newMarker = L.marker(vPos, {
@@ -393,12 +403,14 @@ const MapViewComponent: React.FC<MapViewProps> = ({
           vehicleMarkerRef.current = newMarker;
         }
 
-        // ONLY glide camera if Follow Mode is explicitly ON (e.g. active navigation)
+        // Glide camera at 15 Hz cadence to prevent DOM/tile recalculation bottleneck
         if (
           followModeRef.current &&
           map &&
-          !isProgrammaticMoveRef.current
+          !isProgrammaticMoveRef.current &&
+          now - lastCameraPanTime > 65
         ) {
+          lastCameraPanTime = now;
           map.panTo(vPos, { animate: false });
         }
 
@@ -538,27 +550,6 @@ const MapViewComponent: React.FC<MapViewProps> = ({
       }
     }
 
-    // 4. Dead Reckoning Path (Amber Dashed Line)
-    if (deadReckoningPath && deadReckoningPath.length > 0) {
-      L.polyline(deadReckoningPath, {
-        color: '#CA8A04',
-        weight: 4,
-        dashArray: '8, 8',
-        opacity: 0.95,
-        lineCap: 'round',
-      }).addTo(routeGroup);
-    }
-
-    // 5. Raw INS Path (Red Transparent Line)
-    if (rawInsPath && rawInsPath.length > 0) {
-      L.polyline(rawInsPath, {
-        color: '#DC2626',
-        weight: 3,
-        dashArray: '4, 4',
-        opacity: 0.5,
-        lineCap: 'round',
-      }).addTo(routeGroup);
-    }
   }, [
     mode,
     startCoords,
@@ -566,13 +557,51 @@ const MapViewComponent: React.FC<MapViewProps> = ({
     routes,
     selectedRouteIndex,
     routeCoordinates,
-    deadReckoningPath,
-    rawInsPath,
     showRoute,
     onStartDragEnd,
     onDestinationDragEnd,
     onSelectRoute,
   ]);
+
+  // High-Performance Dynamic Path Updater (DR & INS polylines updated in-place with setLatLngs)
+  useEffect(() => {
+    const pathGroup = pathLayerGroupRef.current;
+    if (!pathGroup) return;
+
+    if (deadReckoningPath && deadReckoningPath.length > 0) {
+      if (drPolylineRef.current) {
+        drPolylineRef.current.setLatLngs(deadReckoningPath);
+      } else {
+        drPolylineRef.current = L.polyline(deadReckoningPath, {
+          color: '#CA8A04',
+          weight: 4,
+          dashArray: '8, 8',
+          opacity: 0.95,
+          lineCap: 'round',
+        }).addTo(pathGroup);
+      }
+    } else if (drPolylineRef.current) {
+      drPolylineRef.current.remove();
+      drPolylineRef.current = null;
+    }
+
+    if (rawInsPath && rawInsPath.length > 0) {
+      if (insPolylineRef.current) {
+        insPolylineRef.current.setLatLngs(rawInsPath);
+      } else {
+        insPolylineRef.current = L.polyline(rawInsPath, {
+          color: '#DC2626',
+          weight: 3,
+          dashArray: '4, 4',
+          opacity: 0.5,
+          lineCap: 'round',
+        }).addTo(pathGroup);
+      }
+    } else if (insPolylineRef.current) {
+      insPolylineRef.current.remove();
+      insPolylineRef.current = null;
+    }
+  }, [deadReckoningPath, rawInsPath]);
 
   // Explicit User Camera Actions
   const handleZoomIn = () => {

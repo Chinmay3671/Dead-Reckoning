@@ -113,8 +113,8 @@ export const SensorService = {
     if (!SensorService.hasMotionSupport()) return () => {};
 
     const handler = (event: DeviceMotionEvent) => {
-      // 1. Accelerometer: Prefer linear acceleration, fallback to acceleration with gravity
-      const accel = event.acceleration || event.accelerationIncludingGravity;
+      // 1. Accelerometer: Prefer acceleration with gravity (raw specific force required for strapdown INS mechanization), fallback to linear
+      const accel = event.accelerationIncludingGravity || event.acceleration;
       const ax = accel?.x != null ? accel.x : 0;
       const ay = accel?.y != null ? accel.y : 0;
       const az = accel?.z != null ? accel.z : 0;

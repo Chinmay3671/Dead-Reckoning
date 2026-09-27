@@ -301,6 +301,10 @@ export const NavigationProvider: React.FC<{ children: React.ReactNode }> = ({ ch
       hasOrientationHardware: SensorService.hasOrientationSupport(),
     }));
 
+    // Throttling timers for high-frequency hardware sensor streams
+    let lastSensorStateDispatch = 0;
+    let lastLogStreamDispatch = 0;
+
     // Motion Sensor (3-Axis Accel + 3-Axis Gyro)
     const unsubMotion = SensorService.subscribeMotion((data) => {
       const now = Date.now();
@@ -314,44 +318,55 @@ export const NavigationProvider: React.FC<{ children: React.ReactNode }> = ({ ch
       eventTimestampsRef.current = eventTimestampsRef.current.filter((t) => t > oneSecAgo);
       const currentRate = eventTimestampsRef.current.length;
 
-      setRealSensors((prev) => ({
-        ...prev,
-        ax: rawAx,
-        ay: rawAy,
-        az: rawAz,
-        accelMag: data.accelMag,
-        gx: data.gx,
-        gy: data.gy,
-        gz: data.gz,
-        gyroMag: data.gyroMag,
-        intervalMs: data.intervalMs,
-        sampleRateHz: currentRate,
-        timestamp: now,
-      }));
+      // Throttle React state updates to 20Hz (~50ms) to prevent render storms
+      if (now - lastSensorStateDispatch >= 50) {
+        lastSensorStateDispatch = now;
 
-      setTelemetry((prev) => ({
-        ...prev,
-        ax: Math.round(rawAx * 100) / 100,
-        ay: Math.round(rawAy * 100) / 100,
-        az: Math.round(rawAz * 100) / 100,
-        sampleRateHz: currentRate,
-        isStreamingMotion: true,
-        lastEventTimestamp: now,
-      }));
-
-      setSensorStatus((prev) => ({ ...prev, accel: true, gyro: true }));
-
-      // Add to rolling sensor event stream (limit 20 entries)
-      setSensorEventsStream((prev) => [
-        {
-          id: `motion-${now}-${Math.floor(Math.random() * 1000)}`,
+        setRealSensors((prev) => ({
+          ...prev,
+          ax: rawAx,
+          ay: rawAy,
+          az: rawAz,
+          accelMag: data.accelMag,
+          gx: data.gx,
+          gy: data.gy,
+          gz: data.gz,
+          gyroMag: data.gyroMag,
+          intervalMs: data.intervalMs,
+          sampleRateHz: currentRate,
           timestamp: now,
-          type: 'devicemotion',
-          summary: `Accel X:${rawAx.toFixed(2)} Y:${rawAy.toFixed(2)} Z:${rawAz.toFixed(2)} m/s² | Gyro ${data.gyroMag.toFixed(2)}°/s`,
-          details: { ax: rawAx, ay: rawAy, az: rawAz, gx: data.gx, gy: data.gy, gz: data.gz },
-        },
-        ...prev.slice(0, 19),
-      ]);
+        }));
+
+        setTelemetry((prev) => ({
+          ...prev,
+          ax: Math.round(rawAx * 100) / 100,
+          ay: Math.round(rawAy * 100) / 100,
+          az: Math.round(rawAz * 100) / 100,
+          sampleRateHz: currentRate,
+          isStreamingMotion: true,
+          lastEventTimestamp: now,
+        }));
+
+        setSensorStatus((prev) => {
+          if (prev.accel && prev.gyro) return prev;
+          return { ...prev, accel: true, gyro: true };
+        });
+      }
+
+      // Throttle log event stream generation to 2Hz (every 500ms)
+      if (now - lastLogStreamDispatch >= 500) {
+        lastLogStreamDispatch = now;
+        setSensorEventsStream((prev) => [
+          {
+            id: `motion-${now}-${Math.floor(Math.random() * 1000)}`,
+            timestamp: now,
+            type: 'devicemotion',
+            summary: `Accel X:${rawAx.toFixed(2)} Y:${rawAy.toFixed(2)} Z:${rawAz.toFixed(2)} m/s² | Gyro ${data.gyroMag.toFixed(2)}°/s`,
+            details: { ax: rawAx, ay: rawAy, az: rawAz, gx: data.gx, gy: data.gy, gz: data.gz },
+          },
+          ...prev.slice(0, 19),
+        ]);
+      }
     });
 
     // Orientation Sensor (Pitch, Roll, Yaw, Heading)
@@ -377,19 +392,8 @@ export const NavigationProvider: React.FC<{ children: React.ReactNode }> = ({ ch
       }));
 
       if (data.alpha !== null || data.headingDeg !== null) {
-        setSensorStatus((prev) => ({ ...prev, compass: true }));
+        setSensorStatus((prev) => (prev.compass ? prev : { ...prev, compass: true }));
       }
-
-      setSensorEventsStream((prev) => [
-        {
-          id: `orient-${now}-${Math.floor(Math.random() * 1000)}`,
-          timestamp: now,
-          type: 'deviceorientation',
-          summary: `Yaw:${data.alpha != null ? data.alpha.toFixed(1) : 'N/A'}° Pitch:${data.beta != null ? data.beta.toFixed(1) : 'N/A'}° Roll:${data.gamma != null ? data.gamma.toFixed(1) : 'N/A'}°`,
-          details: { alpha: data.alpha, beta: data.beta, gamma: data.gamma, heading: data.headingDeg },
-        },
-        ...prev.slice(0, 19),
-      ]);
     });
 
     // Magnetometer Sensor
@@ -486,6 +490,35 @@ export const NavigationProvider: React.FC<{ children: React.ReactNode }> = ({ ch
       unsubGps();
     };
   }, []);
+
+  // Foreground Resume & Hardware Permission Re-Verification Lifecycle
+  const checkHardwarePermissions = useCallback(async () => {
+    const gpsState = await LocationService.checkPermissionState();
+    setSensorStatus((prev) => ({
+      ...prev,
+      gpsPermission: gpsState,
+      hasMotionHardware: SensorService.hasMotionSupport(),
+      hasOrientationHardware: SensorService.hasOrientationSupport(),
+    }));
+  }, []);
+
+  useEffect(() => {
+    checkHardwarePermissions();
+
+    const handleResume = () => {
+      if (document.visibilityState === 'visible') {
+        checkHardwarePermissions();
+      }
+    };
+
+    document.addEventListener('visibilitychange', handleResume);
+    window.addEventListener('focus', handleResume);
+
+    return () => {
+      document.removeEventListener('visibilitychange', handleResume);
+      window.removeEventListener('focus', handleResume);
+    };
+  }, [checkHardwarePermissions]);
 
   // GPS Staleness Monitor (Updates location age and detects stale GPS)
   useEffect(() => {

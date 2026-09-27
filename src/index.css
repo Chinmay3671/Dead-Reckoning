@@ -74,3 +74,18 @@
   background: #FFFFFF !important;
   box-shadow: none !important;
 }
+
+/* Hardware-Accelerated Smooth Map Marker Animations */
+.leaflet-marker-icon {
+  will-change: transform;
+}
+
+.custom-chevron-icon {
+  will-change: transform;
+  pointer-events: none;
+}
+
+.chevron-arrow {
+  will-change: transform;
+  transition: transform 90ms cubic-bezier(0.25, 1, 0.5, 1);
+}

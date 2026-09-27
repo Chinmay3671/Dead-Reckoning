@@ -20,8 +20,8 @@ export class EkfCore {
   constructor() {
     this.x = Matrix.zeros(15, 1);
     this.P = Matrix.zeros(15, 15);
-    for (let i = 0; i < 3; i++) this.P.set(i, i, 0.1); // Position
-    for (let i = 3; i < 6; i++) this.P.set(i, i, 0.1); // Velocity
+    for (let i = 0; i < 3; i++) this.P.set(i, i, 5.0); // Position (5.0m variance allows rapid GNSS tracking)
+    for (let i = 3; i < 6; i++) this.P.set(i, i, 1.0); // Velocity
     for (let i = 6; i < 9; i++) this.P.set(i, i, 0.001); // Attitude
     for (let i = 9; i < 12; i++) this.P.set(i, i, 0.0001); // Accel bias
     for (let i = 12; i < 15; i++) this.P.set(i, i, 0.00001); // Gyro bias
@@ -162,7 +162,8 @@ export class EkfCore {
     H: Matrix,
     z: Matrix,
     R: Matrix,
-    chiSquareThreshold: number = 6.0
+    chiSquareThreshold: number = 6.0,
+    updateAttitude: boolean = true
   ): boolean {
     const S = H.mmul(this.P).mmul(H.transpose()).add(R);
     const S_inv = inverse(S);
@@ -190,18 +191,20 @@ export class EkfCore {
     this.ins.velocity.y += this.x.get(4, 0);
     this.ins.velocity.z += this.x.get(5, 0);
 
-    // Clamp attitude error correction to max ~3 degrees (0.05 rad)
-    const maxAttJump = 0.05;
-    const dPitch = Math.max(-maxAttJump, Math.min(maxAttJump, this.x.get(6, 0)));
-    const dRoll = Math.max(-maxAttJump, Math.min(maxAttJump, this.x.get(7, 0)));
-    const dYaw = Math.max(-maxAttJump, Math.min(maxAttJump, this.x.get(8, 0)));
+    if (updateAttitude) {
+      // Clamp attitude error correction to max ~3 degrees (0.05 rad)
+      const maxAttJump = 0.05;
+      const dPitch = Math.max(-maxAttJump, Math.min(maxAttJump, this.x.get(6, 0)));
+      const dRoll = Math.max(-maxAttJump, Math.min(maxAttJump, this.x.get(7, 0)));
+      const dYaw = Math.max(-maxAttJump, Math.min(maxAttJump, this.x.get(8, 0)));
 
-    this.ins.attitude.pitch += dPitch;
-    this.ins.attitude.roll += dRoll;
-    this.ins.attitude.yaw += dYaw;
+      this.ins.attitude.pitch += dPitch;
+      this.ins.attitude.roll += dRoll;
+      this.ins.attitude.yaw += dYaw;
+    }
 
-    // Reset error state
-    for (let i = 0; i < 9; i++) {
+    // Reset error state vector after closed-loop feedback
+    for (let i = 0; i < 15; i++) {
       this.x.set(i, 0, 0);
     }
     return true;
@@ -214,13 +217,18 @@ export class EkfCore {
     const C_b_n = this.ins.lastRotationMatrix;
     const vel = this.ins.velocity;
 
-    const v_lat = C_b_n[0][1] * vel.x + C_b_n[1][1] * vel.y + C_b_n[2][1] * vel.z;
+    // Body Frame velocity: v_b = (C_b^n)^T * v_n
+    // Body X is Lateral (Transverse): Col 0 of C_b^n
+    // Body Y is Longitudinal (Forward): Col 1 of C_b^n (UNCONSTRAINED)
+    // Body Z is Vertical: Col 2 of C_b^n
+    const v_lat = C_b_n[0][0] * vel.x + C_b_n[1][0] * vel.y + C_b_n[2][0] * vel.z;
+    const v_fwd = C_b_n[0][1] * vel.x + C_b_n[1][1] * vel.y + C_b_n[2][1] * vel.z;
     const v_vert = C_b_n[0][2] * vel.x + C_b_n[1][2] * vel.y + C_b_n[2][2] * vel.z;
 
     const H = Matrix.zeros(2, 15);
-    H.set(0, 3, C_b_n[0][1]);
-    H.set(0, 4, C_b_n[1][1]);
-    H.set(0, 5, C_b_n[2][1]);
+    H.set(0, 3, C_b_n[0][0]);
+    H.set(0, 4, C_b_n[1][0]);
+    H.set(0, 5, C_b_n[2][0]);
 
     H.set(1, 3, C_b_n[0][2]);
     H.set(1, 4, C_b_n[1][2]);
@@ -232,7 +240,14 @@ export class EkfCore {
     R.set(0, 0, R_lat);
     R.set(1, 1, R_vert);
 
-    this.applyMeasurementUpdate(H, z, R, 12.0);
+    // Apply EKF covariance update for lateral/vertical states without corrupting pitch/roll attitude
+    this.applyMeasurementUpdate(H, z, R, Infinity, false);
+
+    // Explicitly project velocity to preserve longitudinal forward velocity in Body frame
+    this.ins.velocity.x = C_b_n[0][1] * v_fwd;
+    this.ins.velocity.y = C_b_n[1][1] * v_fwd;
+    this.ins.velocity.z = C_b_n[2][1] * v_fwd;
+
     this.applyVelocityGuard();
   }
 
@@ -307,7 +322,7 @@ export class EkfCore {
           [effectiveVel[1] - this.ins.velocity.y],
           [effectiveVel[2] - this.ins.velocity.z],
         ]);
-        threshold = 25.0;
+        threshold = Infinity;
       } else {
         H = Matrix.zeros(3, 15);
         for (let i = 0; i < 3; i++) {
@@ -324,10 +339,18 @@ export class EkfCore {
           [gnssPos[1] - this.ins.position.y],
           [gnssPos[2] - this.ins.position.z],
         ]);
-        threshold = 7.8;
+        threshold = Infinity;
       }
 
       this.applyMeasurementUpdate(H, z, R, threshold);
+      if (state === 'GOOD') {
+        const dX = Math.abs(gnssPos[0] - this.ins.position.x);
+        const dY = Math.abs(gnssPos[1] - this.ins.position.y);
+        if (dX > 10 || dY > 10) {
+          this.ins.position.x = gnssPos[0];
+          this.ins.position.y = gnssPos[1];
+        }
+      }
     } else {
       // WEAK_LOST State
       const aiCorrection = this.aiModel.predictError(
@@ -337,23 +360,13 @@ export class EkfCore {
       );
       this.lastAiCorrection = aiCorrection ? [...aiCorrection] : null;
 
-      H = Matrix.zeros(2, 15);
-      H.set(0, 3, 1);
-      H.set(1, 4, 1);
-
-      R = Matrix.eye(2).mul(0.5);
-
       if (aiCorrection) {
+        H = Matrix.zeros(2, 15);
+        H.set(0, 3, 1);
+        H.set(1, 4, 1);
+        R = Matrix.eye(2).mul(0.5);
         z = new Matrix([[aiCorrection[0]], [aiCorrection[1]]]);
-      } else {
-        z = Matrix.zeros(2, 1);
-        R = Matrix.eye(2).mul(1000);
-      }
-
-      this.applyMeasurementUpdate(H, z, R, 6.0);
-
-      if (this.isAttitudeInitialized) {
-        this.applyNhc(0.05, 0.01);
+        this.applyMeasurementUpdate(H, z, R, 6.0);
       }
     }
 
@@ -377,7 +390,7 @@ export class EkfCore {
       [-this.ins.velocity.z],
     ]);
 
-    this.applyMeasurementUpdate(H, z, R, Infinity);
+    this.applyMeasurementUpdate(H, z, R, Infinity, false);
 
     this.wasZuptActive = true;
 
@@ -438,6 +451,10 @@ export class EkfCore {
     if (this.wasZuptActive) {
       this.postZuptCooldown = this.POST_ZUPT_COOLDOWN_CYCLES;
       this.wasZuptActive = false;
+      // Re-inflate velocity covariance so EKF immediately tracks vehicle dynamics
+      for (let i = 3; i < 6; i++) {
+        this.P.set(i, i, Math.max(this.P.get(i, i), 5.0));
+      }
     }
   }
 }

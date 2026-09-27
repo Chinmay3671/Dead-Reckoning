@@ -120,6 +120,21 @@ export const LocationService = {
   },
 
   /**
+   * Explicitly verify the current hardware GPS permission state via W3C Permissions API.
+   */
+  async checkPermissionState(): Promise<'granted' | 'denied' | 'prompt'> {
+    if (typeof navigator === 'undefined' || !navigator.permissions) {
+      return 'prompt';
+    }
+    try {
+      const status = await navigator.permissions.query({ name: 'geolocation' as PermissionName });
+      return status.state;
+    } catch {
+      return 'prompt';
+    }
+  },
+
+  /**
    * Acquire live current GPS coordinates via HTML5 Geolocation API with high accuracy
    * and reverse geocode to a human-readable street/city name.
    */
@@ -129,54 +144,66 @@ export const LocationService = {
     }
 
     return new Promise((resolve, reject) => {
-      navigator.geolocation.getCurrentPosition(
-        async (position) => {
-          const lat = position.coords.latitude;
-          const lng = position.coords.longitude;
-          const accuracy = position.coords.accuracy != null ? Math.round(position.coords.accuracy * 10) / 10 : null;
-          const altitude = position.coords.altitude != null ? Math.round(position.coords.altitude * 10) / 10 : null;
-          const speed = position.coords.speed != null ? Math.round(position.coords.speed * 3.6 * 10) / 10 : null; // m/s to km/h
-          const heading = position.coords.heading != null && !isNaN(position.coords.heading) ? Math.round(position.coords.heading * 10) / 10 : null;
-          const timestamp = position.timestamp || Date.now();
+      // Primary Attempt: High Accuracy GPS (8000ms timeout, 15s cached maximumAge)
+      const attemptGetPosition = (highAccuracy: boolean, isFallback = false) => {
+        navigator.geolocation.getCurrentPosition(
+          async (position) => {
+            const lat = position.coords.latitude;
+            const lng = position.coords.longitude;
+            const accuracy = position.coords.accuracy != null ? Math.round(position.coords.accuracy * 10) / 10 : null;
+            const altitude = position.coords.altitude != null ? Math.round(position.coords.altitude * 10) / 10 : null;
+            const speed = position.coords.speed != null ? Math.round(position.coords.speed * 3.6 * 10) / 10 : null; // m/s to km/h
+            const heading = position.coords.heading != null && !isNaN(position.coords.heading) ? Math.round(position.coords.heading * 10) / 10 : null;
+            const timestamp = position.timestamp || Date.now();
 
-          if (!LocationService.isValidCoordinate(lat, lng)) {
-            reject(new Error('Invalid GPS coordinates received from device.'));
-            return;
-          }
+            if (!LocationService.isValidCoordinate(lat, lng)) {
+              reject(new Error('Invalid GPS coordinates received from device.'));
+              return;
+            }
 
-          try {
-            const address = await LocationService.reverseGeocode(lat, lng);
-            resolve({ lat, lng, accuracy, altitude, speed, heading, timestamp, address });
-          } catch {
-            resolve({
-              lat,
-              lng,
-              accuracy,
-              altitude,
-              speed,
-              heading,
-              timestamp,
-              address: `GPS Location (${lat.toFixed(5)}, ${lng.toFixed(5)})`,
-            });
+            try {
+              const address = await LocationService.reverseGeocode(lat, lng);
+              resolve({ lat, lng, accuracy, altitude, speed, heading, timestamp, address });
+            } catch {
+              resolve({
+                lat,
+                lng,
+                accuracy,
+                altitude,
+                speed,
+                heading,
+                timestamp,
+                address: `GPS Location (${lat.toFixed(5)}, ${lng.toFixed(5)})`,
+              });
+            }
+          },
+          (error) => {
+            // If high accuracy GPS timed out or unavailable, fallback to standard Wi-Fi / Cell tower positioning
+            if (!isFallback && (error.code === error.TIMEOUT || error.code === error.POSITION_UNAVAILABLE)) {
+              console.warn('[LocationService] High accuracy GPS timed out. Falling back to standard location provider...');
+              attemptGetPosition(false, true);
+              return;
+            }
+
+            let message = 'Failed to acquire GPS location.';
+            if (error.code === error.PERMISSION_DENIED) {
+              message = 'Location permission denied. Please enable GPS permissions in device settings.';
+            } else if (error.code === error.POSITION_UNAVAILABLE) {
+              message = 'GPS location unavailable.';
+            } else if (error.code === error.TIMEOUT) {
+              message = 'GPS location request timed out. Please ensure Location is enabled on your device.';
+            }
+            reject(new Error(message));
+          },
+          {
+            enableHighAccuracy: highAccuracy,
+            timeout: highAccuracy ? 8000 : 10000,
+            maximumAge: highAccuracy ? 15000 : 60000,
           }
-        },
-        (error) => {
-          let message = 'Failed to acquire GPS location.';
-          if (error.code === error.PERMISSION_DENIED) {
-            message = 'Location permission denied. Please enable GPS permissions.';
-          } else if (error.code === error.POSITION_UNAVAILABLE) {
-            message = 'GPS location unavailable.';
-          } else if (error.code === error.TIMEOUT) {
-            message = 'GPS location request timed out.';
-          }
-          reject(new Error(message));
-        },
-        {
-          enableHighAccuracy: true,
-          timeout: 12000,
-          maximumAge: 0,
-        }
-      );
+        );
+      };
+
+      attemptGetPosition(true, false);
     });
   },
 
@@ -217,14 +244,8 @@ export const LocationService = {
         const speed = position.coords.speed != null ? Math.round(position.coords.speed * 3.6 * 10) / 10 : null;
         const bearing = position.coords.heading != null && !isNaN(position.coords.heading) ? Math.round(position.coords.heading * 10) / 10 : null;
 
-        // 3. Reverse geocode asynchronously
-        let address = `GPS (${lat.toFixed(5)}, ${lng.toFixed(5)})`;
-        try {
-          address = await LocationService.reverseGeocode(lat, lng);
-        } catch {
-          // Fallback to coordinates
-        }
-
+        // 3. Emit immediate GPS fix without waiting for network reverse-geocode (eliminates 300-2000ms latency)
+        const initialAddress = `GPS (${lat.toFixed(5)}, ${lng.toFixed(5)})`;
         onLocation({
           latitude: lat,
           longitude: lng,
@@ -233,11 +254,34 @@ export const LocationService = {
           speed,
           bearing,
           timestamp: ts,
-          address,
+          address: initialAddress,
           source: 'gps',
           isStale: false,
           ageSec: 0,
         });
+
+        // Background reverse-geocode without blocking real-time navigation pipeline
+        LocationService.reverseGeocode(lat, lng)
+          .then((resolvedAddress) => {
+            if (resolvedAddress && resolvedAddress !== initialAddress) {
+              onLocation({
+                latitude: lat,
+                longitude: lng,
+                accuracy,
+                altitude,
+                speed,
+                bearing,
+                timestamp: ts,
+                address: resolvedAddress,
+                source: 'gps',
+                isStale: false,
+                ageSec: 0,
+              });
+            }
+          })
+          .catch(() => {
+            // Retain coordinate address
+          });
       },
       (error) => {
         let msg = 'GPS watch error';
@@ -252,8 +296,8 @@ export const LocationService = {
       },
       {
         enableHighAccuracy: true,
-        timeout: 15000,
-        maximumAge: 0,
+        timeout: 30000,
+        maximumAge: 5000,
       }
     );
 

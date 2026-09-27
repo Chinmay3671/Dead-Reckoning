@@ -65,14 +65,23 @@ export class FusionAdapter {
     };
   }
 
+  public seedOrigin(lat: number, lon: number): void {
+    this.runtime.seedInitialPosition(lat, lon);
+  }
+
   /**
    * Steps the fusion engine with ReckonX sensor and optional location data,
    * returning ReckonX's standard DRPositionEstimate.
    */
   public step(
     sensor: RealSensorData,
-    location?: CurrentLocationData | null
+    location?: CurrentLocationData | null,
+    fallbackOrigin?: [number, number] | null
   ): DRPositionEstimate {
+    if (fallbackOrigin && fallbackOrigin[0] !== 0 && fallbackOrigin[1] !== 0) {
+      this.runtime.seedInitialPosition(fallbackOrigin[0], fallbackOrigin[1]);
+    }
+
     const imuInput = this.adaptImu(sensor);
     const gnssInput = location ? this.adaptGnss(location) : null;
 

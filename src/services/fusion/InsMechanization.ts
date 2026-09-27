@@ -35,10 +35,10 @@ export class InsMechanization {
   }
 
   public initializeAttitude(accel: { x: number; y: number; z: number }) {
-    // Initialize roll and pitch using the gravity vector to prevent massive gravity leakage into horizontal velocity
+    // Initialize roll and pitch using gravity vector to prevent gravity leakage into horizontal velocity
     this.attitude.pitch = Math.atan2(accel.y, accel.z);
     this.attitude.roll = Math.atan2(-accel.x, Math.sqrt(accel.y * accel.y + accel.z * accel.z));
-    // Also seed the LPF history with the initial reading to prevent startup transients
+    // Seed LPF history with initial reading to prevent startup transients
     this.accelXHist = [accel.x, accel.x];
     this.accelYHist = [accel.y, accel.y];
     this.accelZHist = [accel.z, accel.z];
@@ -54,7 +54,7 @@ export class InsMechanization {
 
   /**
    * Applies a 2nd-order Butterworth digital low-pass filter to accelerometer data.
-   * Cutoff = 2.0Hz to attenuate heel-strike transients while preserving walking dynamics.
+   * Cutoff = 2.0Hz to attenuate heel-strike transients while preserving vehicle dynamics.
    * Coefficients are dynamically calculated based on dt via bilinear transform.
    */
   private filterAccel(dt: number, raw: { x: number; y: number; z: number }): { x: number; y: number; z: number } {
@@ -70,17 +70,17 @@ export class InsMechanization {
     }
 
     const fc = 2.0; // Cutoff frequency (Hz)
-    // Protection against dt = 0 or extremely small
-    const safeDt = Math.max(dt, 0.001); 
-    const w0 = 2 * Math.PI * fc * safeDt;
-    const alpha = Math.sin(w0) / Math.SQRT2;
+    const safeDt = Math.max(dt, 0.001);
+    const K = Math.tan(Math.PI * fc * safeDt);
+    const K2 = K * K;
+    const sqrt2K = Math.SQRT2 * K;
+    const a0 = 1 + sqrt2K + K2;
 
-    const a0 = 1 + alpha;
-    const b0 = ((1 - Math.cos(w0)) / 2) / a0;
-    const b1 = (1 - Math.cos(w0)) / a0;
-    const b2 = ((1 - Math.cos(w0)) / 2) / a0;
-    const a1 = (-2 * Math.cos(w0)) / a0;
-    const a2 = (1 - alpha) / a0;
+    const b0 = K2 / a0;
+    const b1 = (2 * K2) / a0;
+    const b2 = K2 / a0;
+    const a1 = (2 * (K2 - 1)) / a0;
+    const a2 = (1 - sqrt2K + K2) / a0;
 
     const processAxis = (x: number, xHist: number[], yHist: number[]) => {
       const y = b0 * x + b1 * xHist[0] + b2 * xHist[1] - a1 * yHist[0] - a2 * yHist[1];
@@ -114,32 +114,31 @@ export class InsMechanization {
     const fAccel = this.filterAccel(dt, accel);
 
     // 1. Update attitude (Euler angles integration)
-    // For a simple strapdown, we integrate gyro directly into roll/pitch/yaw.
-    // In a real system, quaternions are better to avoid gimbal lock.
-    this.attitude.pitch += gyro.x * dt;
-    this.attitude.roll += gyro.y * dt;
+    this.attitude.roll += gyro.x * dt;
+    this.attitude.pitch += gyro.y * dt;
     this.attitude.yaw += gyro.z * dt;
 
     // 2. Transform body frame acceleration to navigation frame (ENU)
-    const cr = Math.cos(this.attitude.pitch);
-    const sr = Math.sin(this.attitude.pitch);
-    const cp = Math.cos(this.attitude.roll);
-    const sp = Math.sin(this.attitude.roll);
-    const cy = Math.cos(this.attitude.yaw);
-    const sy = Math.sin(this.attitude.yaw);
+    const cRoll = Math.cos(this.attitude.roll);
+    const sRoll = Math.sin(this.attitude.roll);
+    const cPitch = Math.cos(this.attitude.pitch);
+    const sPitch = Math.sin(this.attitude.pitch);
+    const cYaw = Math.cos(this.attitude.yaw);
+    const sYaw = Math.sin(this.attitude.yaw);
 
-    // Rotation Matrix R_b^n (Body to Nav ENU)
-    const R11 = cp * cy;
-    const R12 = sr * sp * cy - cr * sy;
-    const R13 = cr * sp * cy + sr * sy;
+    // Rotation Matrix R_b^n (Body Phone Frame to Nav ENU: Pitch around X, Roll around Y, Yaw around Z)
+    // When phone is pitched nose-up (theta > 0), gravity measured along Body Y rotates onto Nav Z (Up)
+    const R11 = cYaw * cRoll - sYaw * sPitch * sRoll;
+    const R12 = -sYaw * cPitch;
+    const R13 = cYaw * sRoll + sYaw * sPitch * cRoll;
 
-    const R21 = cp * sy;
-    const R22 = sr * sp * sy + cr * cy;
-    const R23 = cr * sp * sy - sr * cy;
+    const R21 = sYaw * cRoll + cYaw * sPitch * sRoll;
+    const R22 = cYaw * cPitch;
+    const R23 = sYaw * sRoll - cYaw * sPitch * cRoll;
 
-    const R31 = -sp;
-    const R32 = sr * cp;
-    const R33 = cr * cp;
+    const R31 = -cPitch * sRoll;
+    const R32 = sPitch;
+    const R33 = cPitch * cRoll;
 
     this.lastRotationMatrix = [
       [R11, R12, R13],

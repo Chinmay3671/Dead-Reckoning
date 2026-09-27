@@ -108,7 +108,7 @@ export const OrientationService = {
     let targetHeading = previousHeading;
 
     if (isGnssAvailable) {
-      if (speedKmH > 5) {
+      if (speedKmH > 5.0) {
         // High Speed (> 5 km/h): Rely primarily on GNSS Track Bearing & Trajectory Bearing
         if (gnssTrackBearing !== null && !isNaN(gnssTrackBearing)) {
           if (trajectoryBearing !== null && !isNaN(trajectoryBearing)) {
@@ -128,26 +128,46 @@ export const OrientationService = {
         } else if (magnetometerHeading !== null && !isNaN(magnetometerHeading)) {
           targetHeading = magnetometerHeading;
         }
-      } else if (speedKmH > 2) {
-        // Medium/Low Speed (2 - 5 km/h): Blend Compass and Trajectory
+      } else if (speedKmH > 1.5) {
+        // Medium/Low Speed (1.5 - 5 km/h): Blend Compass and Trajectory
         const baseCompass = magnetometerHeading ?? previousHeading;
         const baseTrajectory = trajectoryBearing ?? gnssTrackBearing ?? baseCompass;
 
         const diff = OrientationService.normalizeAngle(baseTrajectory - baseCompass);
         const shortestDiff = diff > 180 ? diff - 360 : diff;
         targetHeading = OrientationService.normalizeAngle(
-          baseCompass + 0.5 * shortestDiff
+          baseCompass + 0.4 * shortestDiff
         );
       } else {
-        // Stationary / Stopped (<= 2 km/h): Transition smoothly to Hardware Compass
+        // Stationary / Standstill (<= 1.5 km/h): Strictly lock to hardware compass or hold previous heading.
+        // NEVER feed GNSS track or noisy GPS trajectory bearing at standstill!
         if (magnetometerHeading !== null && !isNaN(magnetometerHeading)) {
-          targetHeading = magnetometerHeading;
-        } else if (trajectoryBearing !== null && !isNaN(trajectoryBearing)) {
-          targetHeading = trajectoryBearing;
+          const diff = Math.abs(((magnetometerHeading - previousHeading + 540) % 360) - 180);
+          // Deadband: If compass noise is under 2.0 degrees, hold steady to prevent jitter
+          if (diff < 2.0) {
+            targetHeading = previousHeading;
+          } else {
+            targetHeading = magnetometerHeading;
+          }
+        } else {
+          // If compass unavailable, firmly hold last trusted heading
+          targetHeading = previousHeading;
         }
+        // Heavily damped smoothing at standstill
+        return OrientationService.smoothHeading(previousHeading, targetHeading, 0.08);
       }
     } else {
       // GNSS Outage Mode (Tunnel or Lost Signal): Dead Reckoning + Gyro Integration
+      if (speedKmH <= 1.0) {
+        // Stationary during GNSS outage: Hold previous heading or stabilized compass
+        if (magnetometerHeading !== null && !isNaN(magnetometerHeading)) {
+          targetHeading = magnetometerHeading;
+        } else {
+          targetHeading = previousHeading;
+        }
+        return OrientationService.smoothHeading(previousHeading, targetHeading, 0.08);
+      }
+
       if (gyroZRate !== null && !isNaN(gyroZRate) && Math.abs(gyroZRate) > 0.1) {
         // Integrate gyro Z rate (deg/sec * dt)
         const integratedHeading = previousHeading + gyroZRate * deltaTimeSec;

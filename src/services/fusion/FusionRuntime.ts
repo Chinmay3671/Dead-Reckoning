@@ -49,15 +49,14 @@ export class FusionRuntime {
   private imuWindow: number[][] = [];
   private lastImuTimestamp: number = 0;
   private lastGnssTimestamp: number = 0;
+  private lastGnssSpeed: number | null = null;
 
   private initialLat: number | null = null;
   private initialLon: number | null = null;
   private isAttitudeInitialized = false;
 
-  // ZUPT hysteresis: require N consecutive non-stationary samples before releasing
+  // ZUPT state tracking
   private wasZuptActiveLastCycle = false;
-  private nonStationaryCount = 0;
-  private readonly ZUPT_RELEASE_HYSTERESIS = 3;
 
   // Earth radius in meters
   private readonly R_EARTH = 6378137;
@@ -95,11 +94,11 @@ export class FusionRuntime {
     }
     this.lastImuTimestamp = 0;
     this.lastGnssTimestamp = 0;
+    this.lastGnssSpeed = null;
     this.initialLat = null;
     this.initialLon = null;
     this.isAttitudeInitialized = false;
     this.wasZuptActiveLastCycle = false;
-    this.nonStationaryCount = 0;
     this.latestFusedState = null;
   }
 
@@ -111,6 +110,14 @@ export class FusionRuntime {
     return this.latestFusedState;
   }
 
+  public seedInitialPosition(lat: number, lon: number): void {
+    if (this.initialLat === null || this.initialLon === null) {
+      this.initialLat = lat;
+      this.initialLon = lon;
+      this.pureIns.position = { x: 0, y: 0, z: 0 };
+    }
+  }
+
   public getEkf(): EkfCore {
     return this.ekf;
   }
@@ -118,11 +125,54 @@ export class FusionRuntime {
   public handleGnssUpdate(gnss: FusionGnssInput): void {
     if (gnss.latitude === null || gnss.longitude === null) return;
 
+    // A3 - Stale fix rejection: reject fixes older than 2.0s relative to fusion timeline
+    if (gnss.timestamp) {
+      const currentTimeline = Math.max(this.lastImuTimestamp, this.lastGnssTimestamp);
+      if (currentTimeline > 0 && currentTimeline - gnss.timestamp > 2000) {
+        return;
+      }
+    }
+
+    if (gnss.speed != null && !isNaN(gnss.speed)) {
+      this.lastGnssSpeed = gnss.speed;
+    }
+
+    // Estimate velocity from GNSS speed/heading if available (speed in m/s)
+    let gnssVel: number[] | null = null;
+    if (gnss.speed != null && gnss.heading != null && !isNaN(gnss.speed) && !isNaN(gnss.heading)) {
+      gnssVel = [0, 0, 0];
+      const hdgRad = gnss.heading * (Math.PI / 180);
+      gnssVel[0] = gnss.speed * Math.sin(hdgRad); // East
+      gnssVel[1] = gnss.speed * Math.cos(hdgRad); // North
+
+      if (gnss.speed > 0.5) {
+        this.ekf.getIns().attitude.yaw = -hdgRad;
+        this.pureIns.attitude.yaw = -hdgRad;
+        if (!this.isAttitudeInitialized) {
+          this.ekf.getIns().initializeAttitude({ x: 0, y: 0, z: 9.81 });
+          this.pureIns.initializeAttitude({ x: 0, y: 0, z: 9.81 });
+          this.ekf.getIns().attitude.yaw = -hdgRad;
+          this.pureIns.attitude.yaw = -hdgRad;
+          this.ekf.notifyAttitudeInitialized();
+          this.isAttitudeInitialized = true;
+        }
+      }
+    }
+
     if (this.initialLat === null || this.initialLon === null) {
       this.initialLat = gnss.latitude;
       this.initialLon = gnss.longitude;
       this.pureIns.position = { x: 0, y: 0, z: 0 };
-      this.pureIns.velocity = { x: 0, y: 0, z: 0 };
+      this.pureIns.velocity = gnssVel ? { x: gnssVel[0], y: gnssVel[1], z: gnssVel[2] } : { x: 0, y: 0, z: 0 };
+      if (gnssVel) {
+        this.ekf.getIns().velocity = { x: gnssVel[0], y: gnssVel[1], z: gnssVel[2] };
+      }
+    } else if (gnssVel && gnss.speed && gnss.speed > 0.5) {
+      const curSpeedSq = this.ekf.getIns().velocity.x ** 2 + this.ekf.getIns().velocity.y ** 2;
+      if (curSpeedSq < 0.25) {
+        this.ekf.getIns().velocity = { x: gnssVel[0], y: gnssVel[1], z: gnssVel[2] };
+        this.pureIns.velocity = { x: gnssVel[0], y: gnssVel[1], z: gnssVel[2] };
+      }
     }
 
     // Convert GNSS lat/lon to local ENU
@@ -133,13 +183,11 @@ export class FusionRuntime {
 
     const gnssPos = [dx, dy, 0];
 
-    // Estimate velocity from GNSS speed/heading if available (speed in m/s)
-    let gnssVel: number[] | null = null;
-    if (gnss.speed != null && gnss.heading != null && !isNaN(gnss.speed) && !isNaN(gnss.heading)) {
-      gnssVel = [0, 0, 0];
-      const hdgRad = gnss.heading * (Math.PI / 180);
-      gnssVel[0] = gnss.speed * Math.sin(hdgRad); // East
-      gnssVel[1] = gnss.speed * Math.cos(hdgRad); // North
+    if (gnssVel !== null && (gnssVel[0] !== 0 || gnssVel[1] !== 0)) {
+      if (this.wasZuptActiveLastCycle) {
+        this.ekf.notifyZuptReleased();
+        this.wasZuptActiveLastCycle = false;
+      }
     }
 
     this.lastGnssTimestamp = gnss.timestamp ?? Date.now();
@@ -156,6 +204,7 @@ export class FusionRuntime {
     }
     this.lastImuTimestamp = now;
 
+    // DEBUG-INSTRUMENT: Raw IMU sample arrival (timestamp, accel, gyro, interval dt)
     // Sample vector [ax, ay, az, gx, gy, gz]
     const imuSample = [
       imu.accel.x,
@@ -171,7 +220,32 @@ export class FusionRuntime {
       this.imuWindow.shift();
     }
 
-    // ZUPT / Stationary Detection
+    // Physical ZUPT / Stationary Detection
+    // Thresholds: | |a| - 9.81 | < 0.25 m/s², |w| < 0.05 rad/s, speed < 0.5 m/s
+    const accelMag = Math.sqrt(imu.accel.x * imu.accel.x + imu.accel.y * imu.accel.y + imu.accel.z * imu.accel.z);
+    const gyroMag = Math.sqrt(imu.gyro.x * imu.gyro.x + imu.gyro.y * imu.gyro.y + imu.gyro.z * imu.gyro.z);
+    const currentVel = this.ekf.getIns().velocity;
+    const currentSpeed = Math.sqrt(currentVel.x * currentVel.x + currentVel.y * currentVel.y + currentVel.z * currentVel.z);
+
+    // Initialize attitude on first valid sample
+    if (!this.isAttitudeInitialized) {
+      if (Math.abs(accelMag - 9.81) < 2.0) {
+        const initialAccel = { x: imu.accel.x, y: imu.accel.y, z: imu.accel.z };
+        this.ekf.getIns().initializeAttitude(initialAccel);
+        this.pureIns.initializeAttitude(initialAccel);
+        this.ekf.notifyAttitudeInitialized();
+        this.isAttitudeInitialized = true;
+      } else {
+        return this.emitFusedState(false, now);
+      }
+    }
+
+    // Leveled Navigation-Frame Horizontal Linear Acceleration
+    const C_b_n = this.ekf.getIns().lastRotationMatrix;
+    const a_nx = C_b_n[0][0] * imu.accel.x + C_b_n[0][1] * imu.accel.y + C_b_n[0][2] * imu.accel.z;
+    const a_ny = C_b_n[1][0] * imu.accel.x + C_b_n[1][1] * imu.accel.y + C_b_n[1][2] * imu.accel.z;
+    const horizLinearAccel = Math.sqrt(a_nx * a_nx + a_ny * a_ny);
+
     let isStationary = false;
     if (this.imuWindow.length >= 20) {
       const n = this.imuWindow.length;
@@ -192,37 +266,30 @@ export class FusionRuntime {
       varA /= n;
       varG /= n;
 
-      isStationary = varA < 0.5 && varG < 0.05;
+      // Physical stationary detection:
+      // 1. Total acceleration magnitude close to 1g (9.81 m/s²), invariant to phone tilt/orientation
+      // 2. Leveled horizontal linear acceleration in navigation frame < 0.35 m/s²
+      // 3. Gyroscope rotation magnitude near zero (< 0.08 rad/s)
+      // 4. Acceleration & angular rate variances over rolling 20-sample window are small (pure sensor noise)
+      // 5. Vehicle is not currently moving according to fresh GNSS fixes
+      const isLowVariance = varA < 0.35 && varG < 0.05;
+      const isGravityMagnitude = Math.abs(accelMag - 9.81) < 0.50;
+      const isHorizQuiet = horizLinearAccel < 0.35;
+      const isGyroStationary = gyroMag < 0.08;
+      const isLowVelocity = currentSpeed < 0.8;
+      const isGnssMoving = this.lastGnssSpeed !== null && this.lastGnssSpeed > 0.8 && (now - this.lastGnssTimestamp < 2000);
 
-      // Initial Stationary Alignment Phase
-      if (!this.isAttitudeInitialized) {
-        if (isStationary) {
-          const initialAccel = { x: meanAx, y: meanAy, z: meanAz };
-          this.ekf.getIns().initializeAttitude(initialAccel);
-          this.pureIns.initializeAttitude(initialAccel);
-          this.ekf.notifyAttitudeInitialized();
-          this.isAttitudeInitialized = true;
-        } else {
-          return this.emitFusedState(false, now);
-        }
-      }
-    } else {
-      if (!this.isAttitudeInitialized) {
-        return this.emitFusedState(false, now);
-      }
+      isStationary = isLowVariance && isGravityMagnitude && isHorizQuiet && isGyroStationary && isLowVelocity && !isGnssMoving;
     }
 
-    const posBefore = { ...this.ekf.getPosition() };
-    const purePosBefore = { ...this.pureIns.position };
-
-    // EKF Predict
+    // EKF Predict Step
     this.ekf.predict(
       dt,
       [imuSample[0], imuSample[1], imuSample[2]],
       [imuSample[3], imuSample[4], imuSample[5]]
     );
 
-    // Pure INS Predict
+    // Pure INS Predict Step
     this.pureIns.predict(
       dt,
       { x: imuSample[0], y: imuSample[1], z: imuSample[2] },
@@ -231,35 +298,25 @@ export class FusionRuntime {
 
     if (this.imuWindow.length >= 20) {
       if (isStationary) {
+        // Apply ZUPT to EKF and zero pure INS velocity to prevent stationary integration creep
         this.ekf.updateZupt();
+        this.pureIns.velocity = { x: 0, y: 0, z: 0 };
         this.wasZuptActiveLastCycle = true;
-        this.nonStationaryCount = 0;
-
-        this.ekf.getPosition().x = posBefore.x;
-        this.ekf.getPosition().y = posBefore.y;
-        this.ekf.getPosition().z = posBefore.z;
-        this.pureIns.position.x = purePosBefore.x;
-        this.pureIns.position.y = purePosBefore.y;
-        this.pureIns.position.z = purePosBefore.z;
       } else {
-        this.nonStationaryCount++;
-        if (this.nonStationaryCount <= this.ZUPT_RELEASE_HYSTERESIS) {
-          this.ekf.updateZupt();
-
-          this.ekf.getPosition().x = posBefore.x;
-          this.ekf.getPosition().y = posBefore.y;
-          this.ekf.getPosition().z = posBefore.z;
-          this.pureIns.position.x = purePosBefore.x;
-          this.pureIns.position.y = purePosBefore.y;
-          this.pureIns.position.z = purePosBefore.z;
-        } else if (this.wasZuptActiveLastCycle) {
+        if (this.wasZuptActiveLastCycle) {
           this.ekf.notifyZuptReleased();
           this.wasZuptActiveLastCycle = false;
+        }
+
+        // Apply continuous NHC during dead reckoning / GNSS blackout at IMU rate
+        const isGnssOutage = this.lastGnssTimestamp === 0 || (now - this.lastGnssTimestamp > 1000);
+        if (isGnssOutage && this.isAttitudeInitialized) {
+          this.ekf.applyNhc(0.05, 0.01);
         }
       }
     }
 
-    // Trigger IDR mode if GNSS is lost for > 2 seconds
+    // Trigger IDR mode state transition if GNSS is lost for > 2 seconds
     if (this.lastGnssTimestamp > 0 && now - this.lastGnssTimestamp > 2000) {
       this.ekf.updateGnss([0, 0, 0], [0, 0, 0], null, this.imuWindow);
       this.lastGnssTimestamp = now - 1000;
@@ -303,7 +360,7 @@ export class FusionRuntime {
     const state = this.ekf.getGnssState().getState();
     const sourceMode = state === 'GOOD' || state === 'DEGRADED' ? 'GNSS' : 'IDR';
 
-    let headingDeg = att.yaw * (180 / Math.PI);
+    let headingDeg = -att.yaw * (180 / Math.PI);
     headingDeg = ((headingDeg % 360) + 360) % 360;
 
     let stabilizationInfo = undefined;
