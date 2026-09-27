@@ -24,6 +24,7 @@ export const TelemetryPage: React.FC = () => {
     systemMode,
     isSensorsEnabled,
     sensorStatus,
+    gnssQuality,
     sensorEventsStream,
     toggleSensors,
     refreshGpsLocation,
@@ -274,6 +275,36 @@ export const TelemetryPage: React.FC = () => {
                   }`}
                 />
                 {sensorStatus.gnss && !currentLocation.isStale ? 'ACTIVE' : 'GPS STALE / WAITING'}
+              </span>
+            </div>
+
+            <div className="bg-slate-50 p-2 rounded border border-slate-200">
+              <span className="text-[10px] text-slate-500 block font-sans">GNSS Quality (EKF)</span>
+              <span className="font-bold flex items-center gap-1 font-mono">
+                <span
+                  className={`w-2 h-2 rounded-full ${
+                    gnssQuality === 'GOOD'
+                      ? 'bg-emerald-500'
+                      : gnssQuality === 'DEGRADED'
+                      ? 'bg-amber-500'
+                      : 'bg-rose-500'
+                  }`}
+                />
+                <span
+                  className={
+                    gnssQuality === 'GOOD'
+                      ? 'text-emerald-700'
+                      : gnssQuality === 'DEGRADED'
+                      ? 'text-amber-700'
+                      : 'text-rose-700'
+                  }
+                >
+                  {gnssQuality === 'GOOD'
+                    ? 'GOOD (<10m)'
+                    : gnssQuality === 'DEGRADED'
+                    ? 'DEGRADED (10-25m)'
+                    : 'WEAK / LOST'}
+                </span>
               </span>
             </div>
 

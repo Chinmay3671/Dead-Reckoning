@@ -168,6 +168,7 @@ export interface SettingsState {
   speedUnit: 'km/h' | 'mph';
   distanceUnit: 'km' | 'mi';
   offlineLogs: string;
+  fusionMode: 'legacy' | 'ekf';
 }
 
 export interface UserProfile {
@@ -211,6 +212,8 @@ export interface ToastState {
   message: string;
 }
 
+export type GnssQualityState = 'GOOD' | 'DEGRADED' | 'WEAK_LOST';
+
 export interface NavigationContextType {
   // Central Sources of Truth
   currentLocation: CurrentLocationData;
@@ -219,6 +222,7 @@ export interface NavigationContextType {
   isSensorsEnabled: boolean;
 
   sensorStatus: SensorStatus;
+  gnssQuality: GnssQualityState;
   routeState: RouteState;
   telemetry: TelemetryData;
   settings: SettingsState;

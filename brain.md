@@ -16,9 +16,12 @@ This document is the **central architectural brain and knowledge map** for the *
   * **Backend-Ready Modular Architecture:** Clean REST contracts and service layers behind clean abstractions, ready for instant live integration with fleet monitoring clouds when backend servers come online.
 
 * **Core Features:**
+  * **15-State Error-State Extended Kalman Filter (ES-EKF) Fusion Engine (Default):** High-precision strapdown Inertial Navigation System (INS) mechanization fused with real-time GNSS via a 15-state Error-State Kalman Filter ($\delta\mathbf{p}, \delta\mathbf{v}, \delta\boldsymbol{\theta}, \mathbf{b}_a, \mathbf{b}_g$), Zero Velocity Updates (ZUPT), and Non-Holonomic Constraints (NHC) utilizing `ml-matrix` on a 10 Hz / 100 Hz sensor ticker.
+  * **4-State GNSS Quality State Machine & UI Badging:** Real-time GNSS signal classification into `GOOD (<10m)`, `DEGRADED (10-25m)`, `WEAK`, and `LOST (>25m / no fix)` with hysteresis counters. Surfaced via real-time status badges in Navigation HUD and Telemetry inspector.
+  * **A/B Switchable Fusion Modes:** Defaulting to `ekf` with selectable runtime fallback to `legacy` (kinematic stepping + heading fusion) via `settings.fusionMode` in Profile settings without breaking legacy pipelines.
   * **Real-Time Hardware Sensor Streaming:** Direct ingestion of 3-axis Accelerometer ($a_x, a_y, a_z$, magnitude), 3-axis Gyroscope ($g_x, g_y, g_z$, magnitude), Device Orientation ($\alpha, \beta, \gamma$, heading), and Generic Sensor Magnetometer ($m_x, m_y, m_z$) via W3C `DeviceMotionEvent`, `DeviceOrientationEvent`, and `Magnetometer` APIs with iOS WebKit permission workflows. Timestamps and rolling sample rates (targeting up to ~100 Hz, platform-dependent) are computed in real time.
   * **Continuous Real GPS Location Pipeline:** Continuous GPS fix acquisition via HTML5 Geolocation API (`watchPosition` / `getCurrentPosition`) with strict coordinate bounds validation, chronological timestamp verification, and reverse geocoding.
-  * **Dead Reckoning & Kinematic Engine:** IMU linear acceleration integration, Zero Velocity Update (ZUPT) stationary drift suppression ($|a| < 0.25 \text{ m/s}^2$ for $\ge 0.5\text{s}$), Haversine distance, and Exponential Moving Average (EMA) position filtering for smooth GNSS re-anchoring.
+  * **Legacy Dead Reckoning & Kinematic Engine (Fallback):** IMU linear acceleration integration, Zero Velocity Update (ZUPT) stationary drift suppression ($|a| < 0.25 \text{ m/s}^2$ for $\ge 0.5\text{s}$), Haversine distance, and Exponential Moving Average (EMA) position filtering for smooth GNSS re-anchoring.
   * **Multi-Source Heading Fusion Pipeline:** Speed-aware angular fusion combining Magnetometer compass bearing, GNSS track bearing, Trajectory azimuth, and integrated Gyroscope angular rate with shortest-path angular interpolation to prevent 355° $\rightarrow$ 5° spin glitches.
   * **Vehicle-Specific Multi-Profile Routing:** Dedicated profile routing for **Car** (driving road network, one-ways, turn restrictions), **Bike** (cycling paths, secondary roads), and **Walking** (footpaths, walkways, pedestrian zones). Vehicle selection controls geometry, distance, ETA, turn instructions, and alternative options. Strict profile enforcement prevents silent fallback to Car routing.
   * **Concurrency & Race-Condition Guarded Route Service:** Request-ID tracking, in-flight request cancellation via `AbortController` / `AbortSignal`, and a profile-aware in-memory route cache (`origin + dest + vehicleProfile`).
@@ -169,10 +172,20 @@ reckon-x/
     │   │   ├── profileService.ts   # Operator profile & backend stats integration
     │   │   ├── trackingService.ts  # Live GPS session streaming contracts
     │   │   └── telemetryService.ts # Sensor batch telemetry & analytics contracts
-    │   ├── deadReckoningEngine.ts  # Kinematic stepping, ZUPT, Haversine, LERP & EMA filters
+    │   ├── fusion/                 # 15-State Error-State EKF Fusion Subsystem
+    │   │   ├── __tests__/          # Fusion unit tests
+    │   │   │   └── FusionAdapter.test.ts # Vitest suite for EKF adapter lifecycle
+    │   │   ├── AiMotionModel.ts    # AI motion error model runtime interface & normalization
+    │   │   ├── EkfCore.ts          # 15-state ES-EKF matrix math (ml-matrix)
+    │   │   ├── FusionAdapter.ts    # High-level bridge adapting ReckonX types to EKF runtime
+    │   │   ├── FusionRuntime.ts    # EKF orchestrator managing INS, ZUPT, NHC & GNSS corrections
+    │   │   ├── GnssQualityStateMachine.ts # 4-state GNSS signal quality state machine
+    │   │   ├── InsMechanization.ts # Strapdown INS position/velocity/attitude integration
+    │   │   └── OutputStabilizer.ts # Smoothing & outlier rejection for fused outputs
+    │   ├── deadReckoningEngine.ts  # Legacy kinematic stepping, ZUPT, Haversine, LERP & EMA filters (fallback)
     │   ├── locationService.ts      # Nominatim search, LRU cache, reverse geocoding, GPS watcher
     │   ├── logExportService.ts     # Genuine CSV telemetry log generation & download
-    │   ├── OrientationService.ts   # Multi-source heading fusion & shortest-path angular filter
+    │   ├── OrientationService.ts   # Multi-source heading fusion & shortest-path angular filter (fallback)
     │   ├── routeService.ts         # Multi-profile routing service (Car, Bike, Walking), caching, normalization
     │   ├── sensorService.ts        # Browser motion/orientation listeners & WebKit permission handlers
     │   └── tileCacheService.ts     # IndexedDB tile cache store & offline unavailable placeholder
@@ -189,7 +202,14 @@ reckon-x/
 
 | File | Responsibility | Depends On | Used By | Important Exported Symbols |
 | --- | --- | --- | --- | --- |
-| [`src/config/mapConfig.ts`](file:///c:/Users/chinm/OneDrive/Desktop/All%20in%20one/TY%20Files/copy%20sih26/src/config/mapConfig.ts) | Centralized map, tile, Nominatim, and multi-profile OSRM provider URLs | None | `MapView.tsx`, `locationService.ts`, `routeService.ts` | `MAP_CONFIG` |
+| [`src/services/fusion/FusionAdapter.ts`](file:///c:/Users/chinm/OneDrive/Desktop/All%20in%20one/SIH/reckonx/src/services/fusion/FusionAdapter.ts) | Bridges ReckonX location/sensor types to 15-state EKF runtime; handles unit conversions | `FusionRuntime.ts`, `types/navigation.ts` | `NavigationHudPage.tsx`, `NavigationContext.tsx` | `FusionAdapter`, `FusedNavigationOutput` |
+| [`src/services/fusion/FusionRuntime.ts`](file:///c:/Users/chinm/OneDrive/Desktop/All%20in%20one/SIH/reckonx/src/services/fusion/FusionRuntime.ts) | Coordinates strapdown INS mechanization, EKF prediction, ZUPT/NHC, and GNSS correction updates | `InsMechanization.ts`, `EkfCore.ts`, `GnssQualityStateMachine.ts`, `OutputStabilizer.ts`, `AiMotionModel.ts` | `FusionAdapter.ts` | `FusionRuntime`, `RuntimeConfig` |
+| [`src/services/fusion/EkfCore.ts`](file:///c:/Users/chinm/OneDrive/Desktop/All%20in%20one/SIH/reckonx/src/services/fusion/EkfCore.ts) | Pure 15-state Error-State Kalman Filter matrix mathematics ($F, Q, H, R, K, P$) | `ml-matrix` | `FusionRuntime.ts` | `EkfCore`, `EkfState` |
+| [`src/services/fusion/InsMechanization.ts`](file:///c:/Users/chinm/OneDrive/Desktop/All%20in%20one/SIH/reckonx/src/services/fusion/InsMechanization.ts) | Strapdown inertial navigation equations in local East-North-Up (ENU) frame | None | `FusionRuntime.ts` | `InsMechanization`, `InsState` |
+| [`src/services/fusion/GnssQualityStateMachine.ts`](file:///c:/Users/chinm/OneDrive/Desktop/All%20in%20one/SIH/reckonx/src/services/fusion/GnssQualityStateMachine.ts) | Classifies GNSS signal into GOOD, DEGRADED, WEAK, or LOST with hysteresis | None | `FusionRuntime.ts`, `NavigationContext.tsx`, `NavigationHudPage.tsx`, `TelemetryPage.tsx` | `GnssQualityStateMachine`, `GnssQualityState` |
+| [`src/services/fusion/OutputStabilizer.ts`](file:///c:/Users/chinm/OneDrive/Desktop/All%20in%20one/SIH/reckonx/src/services/fusion/OutputStabilizer.ts) | Filters fused position and heading estimates against jumps and outliers | None | `FusionRuntime.ts` | `OutputStabilizer` |
+| [`src/services/fusion/AiMotionModel.ts`](file:///c:/Users/chinm/OneDrive/Desktop/All%20in%20one/SIH/reckonx/src/services/fusion/AiMotionModel.ts) | AI motion error model runtime interface, feature windowing & normalization | None | `FusionRuntime.ts` | `AiMotionModel` |
+| [`src/config/mapConfig.ts`](file:///c:/Users/chinm/OneDrive/Desktop/All%20in%20one/SIH/reckonx/src/config/mapConfig.ts) | Centralized map, tile, Nominatim, and multi-profile OSRM provider URLs | None | `MapView.tsx`, `locationService.ts`, `routeService.ts` | `MAP_CONFIG` |
 | [`src/config/apiConfig.ts`](file:///c:/Users/chinm/OneDrive/Desktop/All%20in%20one/TY%20Files/copy%20sih26/src/config/apiConfig.ts) | Centralized backend API endpoints & base URL | None | API Service Layer | `API_CONFIG` |
 | [`src/services/api/apiClient.ts`](file:///c:/Users/chinm/OneDrive/Desktop/All%20in%20one/TY%20Files/copy%20sih26/src/services/api/apiClient.ts) | Robust HTTP client handling 400, 401, 403, 404, 409, 500, timeouts & pending backend | `apiConfig.ts` | API Services | `apiClient`, `ApiException` |
 | [`src/services/api/authService.ts`](file:///c:/Users/chinm/OneDrive/Desktop/All%20in%20one/TY%20Files/copy%20sih26/src/services/api/authService.ts) | Backend authentication, tokens, & session management | `apiClient.ts` | `LoginPage.tsx`, `NavigationContext.tsx` | `AuthService` |
@@ -508,16 +528,17 @@ IDR_Tile_Cache_DB (IndexedDB)
 
 ## 13. State Management
 
-All shared application state lives in [`src/context/NavigationContext.tsx`](file:///c:/Users/chinm/OneDrive/Desktop/All%20in%20one/TY%20Files/copy%20sih26/src/context/NavigationContext.tsx):
+All shared application state lives in [`src/context/NavigationContext.tsx`](file:///c:/Users/chinm/OneDrive/Desktop/All%20in%20one/SIH/reckonx/src/context/NavigationContext.tsx):
 
 * `currentLocation`: Physical device location fix (`latitude`, `longitude`, `accuracy`, `altitude`, `speed`, `bearing`, `timestamp`, `source`, `address`, `isStale`, `ageSec`).
+* `gnssQuality`: Real-time 4-state GNSS signal quality (`GOOD`, `DEGRADED`, `WEAK`, `LOST`) evaluated by `GnssQualityStateMachine`.
 * `realSensors`: Real-time hardware measurements ($a_x, a_y, a_z, g_x, g_y, g_z$, pitch, roll, yaw, heading, $m_x, m_y, m_z$, sample rate Hz, interval).
 * `systemMode`: Active data mode (`live` vs. `simulation`).
 * `isSensorsEnabled`: Sensor stream toggle state.
 * `sensorStatus`: Hardware availability flags (`accel`, `gyro`, `compass`, `gnss`, `hasMotionHardware`, `hasOrientationHardware`, `gpsPermission`).
 * `routeState`: Multi-profile route state (`origin`, `destination`, `startCoords`, `destCoords`, `vehicleType`, `routes`, `selectedRouteIndex`, `routeCoordinates`, `distanceKm`, `durationMin`, `steps`, `profileLabel`, `isCalculating`, `error`).
 * `telemetry`: HUD telemetry data (`speed`, `drift`, `eta`, `remainingKm`, acceleration vectors, orientation angles, sample rate Hz).
-* `settings`: User preferences (`highSpeedPolling`, `mapMatching`, `keepScreenAwake`, `autoCenterVehicle`, `speedUnit`, `distanceUnit`, `offlineLogs`).
+* `settings`: User preferences (`highSpeedPolling`, `mapMatching`, `keepScreenAwake`, `autoCenterVehicle`, `speedUnit`, `distanceUnit`, `offlineLogs`, `fusionMode: 'ekf' | 'legacy'`).
 * `matrixScenario`: Auto-detected operational scenario (`scenario1` to `scenario4`).
 * `trackingSession`: Active session metadata, genuine recorded GPS/DR points array, speeds, and DR ratios.
 * `sensorEventsStream`: Rolling buffer of the latest 20 real device sensor events.
@@ -531,16 +552,18 @@ When making modifications to specific subsystems, refer to this exact file mappi
 
 | Area of Change | Primary Source File(s) | Impacted Components / Context |
 | --- | --- | --- |
-| **Map Camera & Viewport Behavior** | [`src/components/MapView.tsx`](file:///c:/Users/chinm/OneDrive/Desktop/All%20in%20one/TY%20Files/copy%20sih26/src/components/MapView.tsx) | Follow Mode, Zoom/Pan controls, Leaflet canvas |
-| **GPS Acquisition & Validation** | [`src/services/locationService.ts`](file:///c:/Users/chinm/OneDrive/Desktop/All%20in%20one/TY%20Files/copy%20sih26/src/services/locationService.ts) | `NavigationContext.tsx` (`currentLocation`), `PermissionsPage.tsx` |
-| **Real Hardware Sensor Streaming** | [`src/services/sensorService.ts`](file:///c:/Users/chinm/OneDrive/Desktop/All%20in%20one/TY%20Files/copy%20sih26/src/services/sensorService.ts) | `NavigationContext.tsx` (`realSensors`), `TelemetryPage.tsx` |
-| **Vehicle-Specific Multi-Profile Routing** | [`src/services/routeService.ts`](file:///c:/Users/chinm/OneDrive/Desktop/All%20in%20one/TY%20Files/copy%20sih26/src/services/routeService.ts) | `mapConfig.ts`, `NavigationContext.tsx` (`routeState`), `RouteSetupPage.tsx` |
-| **Heading Fusion & Angular Math** | [`src/services/OrientationService.ts`](file:///c:/Users/chinm/OneDrive/Desktop/All%20in%20one/TY%20Files/copy%20sih26/src/services/OrientationService.ts) | `NavigationHudPage.tsx`, `MapView.tsx` (chevron rotation) |
-| **Dead Reckoning & ZUPT Kinematics** | [`src/services/deadReckoningEngine.ts`](file:///c:/Users/chinm/OneDrive/Desktop/All%20in%20one/TY%20Files/copy%20sih26/src/services/deadReckoningEngine.ts) | `NavigationHudPage.tsx`, `NavigationContext.tsx` |
-| **Route Setup UI & Selection** | [`src/pages/RouteSetupPage.tsx`](file:///c:/Users/chinm/OneDrive/Desktop/All%20in%20one/TY%20Files/copy%20sih26/src/pages/RouteSetupPage.tsx) | Vehicle selector, search inputs, route alternatives card |
-| **Active Turn-by-Turn Navigation HUD** | [`src/pages/NavigationHudPage.tsx`](file:///c:/Users/chinm/OneDrive/Desktop/All%20in%20one/TY%20Files/copy%20sih26/src/pages/NavigationHudPage.tsx) | Step banner, speedometer, scenario badge, live fusion loop |
-| **Tile Caching & Offline Storage** | [`src/services/tileCacheService.ts`](file:///c:/Users/chinm/OneDrive/Desktop/All%20in%20one/TY%20Files/copy%20sih26/src/services/tileCacheService.ts) | `MapView.tsx`, `NavigationContext.tsx` (`cachedTilesCount`) |
-| **Distance Units & Formatting** | [`src/utils/distanceFormatter.ts`](file:///c:/Users/chinm/OneDrive/Desktop/All%20in%20one/TY%20Files/copy%20sih26/src/utils/distanceFormatter.ts) | All pages displaying distance or remaining km/mi |
+| **15-State Error-State EKF Fusion & INS Mechanization** | [`src/services/fusion/*`](file:///c:/Users/chinm/OneDrive/Desktop/All%20in%20one/SIH/reckonx/src/services/fusion/FusionAdapter.ts) (`EkfCore.ts`, `FusionRuntime.ts`, `InsMechanization.ts`, `FusionAdapter.ts`) | `NavigationHudPage.tsx`, `NavigationContext.tsx`, `ProfilePage.tsx` |
+| **GNSS Quality State Machine & UI Badging** | [`src/services/fusion/GnssQualityStateMachine.ts`](file:///c:/Users/chinm/OneDrive/Desktop/All%20in%20one/SIH/reckonx/src/services/fusion/GnssQualityStateMachine.ts) | `NavigationContext.tsx` (`gnssQuality`), `NavigationHudPage.tsx`, `TelemetryPage.tsx` |
+| **Map Camera & Viewport Behavior** | [`src/components/MapView.tsx`](file:///c:/Users/chinm/OneDrive/Desktop/All%20in%20one/SIH/reckonx/src/components/MapView.tsx) | Follow Mode, Zoom/Pan controls, Leaflet canvas |
+| **GPS Acquisition & Validation** | [`src/services/locationService.ts`](file:///c:/Users/chinm/OneDrive/Desktop/All%20in%20one/SIH/reckonx/src/services/locationService.ts) | `NavigationContext.tsx` (`currentLocation`), `PermissionsPage.tsx` |
+| **Real Hardware Sensor Streaming** | [`src/services/sensorService.ts`](file:///c:/Users/chinm/OneDrive/Desktop/All%20in%20one/SIH/reckonx/src/services/sensorService.ts) | `NavigationContext.tsx` (`realSensors`), `TelemetryPage.tsx` |
+| **Vehicle-Specific Multi-Profile Routing** | [`src/services/routeService.ts`](file:///c:/Users/chinm/OneDrive/Desktop/All%20in%20one/SIH/reckonx/src/services/routeService.ts) | `mapConfig.ts`, `NavigationContext.tsx` (`routeState`), `RouteSetupPage.tsx` |
+| **Heading Fusion & Angular Math (Legacy Fallback)** | [`src/services/OrientationService.ts`](file:///c:/Users/chinm/OneDrive/Desktop/All%20in%20one/SIH/reckonx/src/services/OrientationService.ts) | `NavigationHudPage.tsx`, `MapView.tsx` (chevron rotation) |
+| **Dead Reckoning & ZUPT Kinematics (Legacy Fallback)** | [`src/services/deadReckoningEngine.ts`](file:///c:/Users/chinm/OneDrive/Desktop/All%20in%20one/SIH/reckonx/src/services/deadReckoningEngine.ts) | `NavigationHudPage.tsx`, `NavigationContext.tsx` |
+| **Route Setup UI & Selection** | [`src/pages/RouteSetupPage.tsx`](file:///c:/Users/chinm/OneDrive/Desktop/All%20in%20one/SIH/reckonx/src/pages/RouteSetupPage.tsx) | Vehicle selector, search inputs, route alternatives card |
+| **Active Turn-by-Turn Navigation HUD** | [`src/pages/NavigationHudPage.tsx`](file:///c:/Users/chinm/OneDrive/Desktop/All%20in%20one/SIH/reckonx/src/pages/NavigationHudPage.tsx) | Step banner, speedometer, scenario badge, GNSS quality badge, live fusion loop |
+| **Tile Caching & Offline Storage** | [`src/services/tileCacheService.ts`](file:///c:/Users/chinm/OneDrive/Desktop/All%20in%20one/SIH/reckonx/src/services/tileCacheService.ts) | `MapView.tsx`, `NavigationContext.tsx` (`cachedTilesCount`) |
+| **Distance Units & Formatting** | [`src/utils/distanceFormatter.ts`](file:///c:/Users/chinm/OneDrive/Desktop/All%20in%20one/SIH/reckonx/src/utils/distanceFormatter.ts) | All pages displaying distance or remaining km/mi |
 
 ---
 
@@ -625,23 +648,28 @@ npm run preview
 
 ```text
 PROJECT: reckon-x (ReckonX Navigation)
-STACK: React 19, TypeScript 6, Vite 5, TailwindCSS v4 (@tailwindcss/vite), Leaflet 1.9, Lucide React, Oxlint
-ARCHITECTURE: Client-side Edge SPA, React Context State, Multi-Profile OSRM Routing, Leaflet Canvas Map, IndexedDB Tile Cache, W3C Sensor Streaming, Dead Reckoning Engine
+STACK: React 19, TypeScript 6, Vite 5, TailwindCSS v4 (@tailwindcss/vite), Leaflet 1.9, Lucide React, ml-matrix, Oxlint
+ARCHITECTURE: Client-side Edge SPA, React Context State, 15-State Error-State EKF Fusion, Multi-Profile OSRM Routing, Leaflet Canvas Map, IndexedDB Tile Cache, W3C Sensor Streaming, Dead Reckoning Engine
 MAIN ENTRY POINT: src/main.tsx -> src/App.tsx
 IMPORTANT DIRECTORIES & SERVICES:
+  - src/services/fusion/FusionAdapter.ts : Bridge between ReckonX telemetry/sensors and 15-state EKF runtime
+  - src/services/fusion/FusionRuntime.ts : EKF orchestrator (INS mechanization, ZUPT/NHC, GNSS state machine)
+  - src/services/fusion/EkfCore.ts       : 15-state Error-State EKF matrix math (ml-matrix)
+  - src/services/fusion/GnssQualityStateMachine.ts : 4-state GNSS signal quality classifier (GOOD/DEGRADED/WEAK/LOST)
   - src/services/routeService.ts        : Multi-profile routing (Car, Bike, Walking), concurrency handling, profile-aware cache
   - src/services/locationService.ts     : Real GPS watcher, coordinate validation, Nominatim geocoding & LRU cache
   - src/services/sensorService.ts       : Real browser hardware sensor streams (devicemotion, deviceorientation, magnetometer)
-  - src/services/OrientationService.ts  : Multi-source heading fusion (Compass + GNSS + Gyro + Trajectory) & smoothHeading
-  - src/services/deadReckoningEngine.ts : IMU kinematic stepping, ZUPT stationary filter, Haversine, EMA smoothing
+  - src/services/OrientationService.ts  : Multi-source heading fusion (Compass + GNSS + Gyro + Trajectory) & smoothHeading (fallback)
+  - src/services/deadReckoningEngine.ts : IMU kinematic stepping, ZUPT stationary filter, Haversine, EMA smoothing (fallback)
   - src/services/tileCacheService.ts    : IndexedDB map tile cache ("IDR_Tile_Cache_DB", store: "tiles")
   - src/components/MapView.tsx          : Single-init Leaflet map, decoupled camera vs GPS, 60 FPS marker LERP, Follow Mode
-  - src/context/NavigationContext.tsx   : Central state (currentLocation, realSensors, routeState, telemetry, matrixScenario)
+  - src/context/NavigationContext.tsx   : Central state (currentLocation, realSensors, routeState, telemetry, matrixScenario, gnssQuality)
   - src/pages/RouteSetupPage.tsx        : Multi-vehicle routing, alternatives selection, origin/dest search
-  - src/pages/NavigationHudPage.tsx     : Turn-by-turn navigation HUD, live fusion loop, DR kinematic takeover
-CORE FEATURES: Real-Time Hardware Sensor Streaming (up to ~100 Hz), Continuous GPS Ingestion, Dead Reckoning in Tunnels/Zero-GNSS, ZUPT Drift Suppression, Multi-Source Heading Fusion, Vehicle-Specific Routing (Car/Bike/Walking), Profile-Aware Route Caching, Decoupled Map Camera & Free Exploration, IndexedDB Offline Map Caching, Auto-Detected 4 Matrix Scenarios, Genuine CSV Telemetry Log Export.
+  - src/pages/NavigationHudPage.tsx     : Turn-by-turn navigation HUD, live EKF fusion loop, GNSS quality badge, DR kinematic takeover
+CORE FEATURES: 15-State Error-State EKF Fusion Engine (Default), GNSS Quality State Machine & Badging, Real-Time Hardware Sensor Streaming (up to ~100 Hz), Continuous GPS Ingestion, Dead Reckoning in Tunnels/Zero-GNSS, ZUPT Drift Suppression, Multi-Source Heading Fusion, Vehicle-Specific Routing (Car/Bike/Walking), Profile-Aware Route Caching, Decoupled Map Camera & Free Exploration, IndexedDB Offline Map Caching, Auto-Detected 4 Matrix Scenarios, Genuine CSV Telemetry Log Export.
 CRITICAL INVARIANTS:
   - Strict No Fake Data in Live Device Mode.
+  - EKF fusion is default ('ekf'); legacy kinematic engine preserved as selectable fallback ('legacy').
   - GPS fix is primary source of truth; demo coordinates are fallback-only.
   - Decouple GPS marker tracking from map viewport; never force-center an actively explored map.
   - Vehicle selection controls real routing backend; never mix profiles or fall back silently to Car.

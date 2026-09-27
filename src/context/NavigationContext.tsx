@@ -14,6 +14,7 @@ import type {
   CurrentLocationData,
   RealSensorData,
   SystemDataMode,
+  GnssQualityState,
 } from '../types/navigation';
 import { LocationService } from '../services/locationService';
 import { RouteService } from '../services/routeService';
@@ -22,6 +23,7 @@ import { TileCacheService } from '../services/tileCacheService';
 import { LogExportService } from '../services/logExportService';
 import { formatKmDistance } from '../utils/distanceFormatter';
 import type { RecordedGPSPoint } from '../services/api/trackingService';
+import { GnssQualityStateMachine } from '../services/fusion/GnssQualityStateMachine';
 
 const SETTINGS_STORAGE_KEY = 'reckonx_user_settings';
 
@@ -33,6 +35,7 @@ const defaultSettings: SettingsState = {
   speedUnit: 'km/h',
   distanceUnit: 'km',
   offlineLogs: '0 KB',
+  fusionMode: 'legacy',
 };
 
 function loadStoredSettings(): SettingsState {
@@ -167,6 +170,7 @@ export const NavigationProvider: React.FC<{ children: React.ReactNode }> = ({ ch
   const [isSensorsEnabled, setIsSensorsEnabled] = useState<boolean>(true);
 
   const [sensorStatus, setSensorStatus] = useState<SensorStatus>(initialSensorStatus);
+  const [gnssQuality, setGnssQuality] = useState<GnssQualityState>('WEAK_LOST');
   const [routeState, setRouteState] = useState<RouteState>(initialRouteState);
   const [telemetry, setTelemetry] = useState<TelemetryData>(initialTelemetry);
   const [settings, setSettings] = useState<SettingsState>(loadStoredSettings);
@@ -191,6 +195,9 @@ export const NavigationProvider: React.FC<{ children: React.ReactNode }> = ({ ch
 
   // Track if origin was set manually by user
   const isOriginManualRef = useRef<boolean>(false);
+
+  // EKF GNSS Quality State Machine
+  const gnssQualityStateMachineRef = useRef(new GnssQualityStateMachine());
 
   // Refresh cached tiles count from IndexedDB
   const refreshCacheCount = useCallback(async () => {
@@ -438,9 +445,14 @@ export const NavigationProvider: React.FC<{ children: React.ReactNode }> = ({ ch
     const unsubGps = LocationService.startLocationWatch(
       (pos: CurrentLocationData) => {
         setCurrentLocation(pos);
+        gnssQualityStateMachineRef.current.updateState(pos.accuracy);
+        const quality = gnssQualityStateMachineRef.current.getState();
+        setGnssQuality(quality);
+        const isFixUsable = quality !== 'WEAK_LOST' && !pos.isStale && pos.latitude !== null;
+
         setSensorStatus((prev) => ({
           ...prev,
-          gnss: true,
+          gnss: isFixUsable,
           gpsPermission: 'granted',
         }));
 
@@ -460,6 +472,8 @@ export const NavigationProvider: React.FC<{ children: React.ReactNode }> = ({ ch
       },
       (error) => {
         console.warn('GPS watch status:', error.message);
+        gnssQualityStateMachineRef.current.updateState(null);
+        setGnssQuality('WEAK_LOST');
         if (error.message.includes('denied')) {
           setSensorStatus((prev) => ({ ...prev, gnss: false, gpsPermission: 'denied' }));
         } else {
@@ -481,6 +495,8 @@ export const NavigationProvider: React.FC<{ children: React.ReactNode }> = ({ ch
         const ageSec = Math.round((Date.now() - prev.timestamp) / 1000);
         const isStale = ageSec > 10;
         if (isStale && sensorStatus.gnss) {
+          gnssQualityStateMachineRef.current.updateState(null);
+          setGnssQuality('WEAK_LOST');
           setSensorStatus((s) => ({ ...s, gnss: false })); // Trigger DR fallback if GPS stale
         }
         return {
@@ -514,7 +530,11 @@ export const NavigationProvider: React.FC<{ children: React.ReactNode }> = ({ ch
       };
 
       setCurrentLocation(updated);
-      setSensorStatus((prev) => ({ ...prev, gnss: true, gpsPermission: 'granted' }));
+      gnssQualityStateMachineRef.current.updateState(loc.accuracy);
+      const quality = gnssQualityStateMachineRef.current.getState();
+      setGnssQuality(quality);
+      const isFixUsable = quality !== 'WEAK_LOST';
+      setSensorStatus((prev) => ({ ...prev, gnss: isFixUsable, gpsPermission: 'granted' }));
 
       if (!isOriginManualRef.current) {
         setRouteState((prev) => ({
@@ -1041,6 +1061,7 @@ export const NavigationProvider: React.FC<{ children: React.ReactNode }> = ({ ch
         systemMode,
         isSensorsEnabled,
         sensorStatus,
+        gnssQuality,
         routeState,
         telemetry,
         settings,

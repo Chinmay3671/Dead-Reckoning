@@ -24,6 +24,7 @@ import {
 import { MobileShell } from '../components/MobileShell';
 import { DeadReckoningEngine } from '../services/deadReckoningEngine';
 import { OrientationService } from '../services/OrientationService';
+import { fusionAdapter } from '../services/fusion/FusionAdapter';
 import { formatKmDistance } from '../utils/distanceFormatter';
 import { calculateRemainingRoadDistance } from '../utils/routeProgress';
 import type { OperationalMatrixScenario } from '../types/navigation';
@@ -45,11 +46,37 @@ const LiveMetricsOverlay: React.FC<{
   onToggleCameraMode,
   onEndNavigation,
 }) => {
-  const { settings, telemetry, sensorStatus, isOnline, matrixScenario, cachedTilesCount } = useNavigationContext();
+  const { settings, telemetry, sensorStatus, gnssQuality, isOnline, matrixScenario, cachedTilesCount } = useNavigationContext();
   const [showExitModal, setShowExitModal] = useState(false);
 
   const isHeadingValid = isGnssActive || sensorStatus.compass || liveHeading > 0;
   const formattedHeading = OrientationService.formatCardinalHeading(liveHeading, isHeadingValid);
+
+  const gnssQualityStyles: Record<
+    string,
+    { label: string; bg: string; border: string; text: string }
+  > = {
+    GOOD: {
+      label: 'GNSS: GOOD (<10m)',
+      bg: 'bg-emerald-50 text-emerald-800 border-emerald-200',
+      border: 'border-emerald-300',
+      text: 'text-emerald-700',
+    },
+    DEGRADED: {
+      label: 'GNSS: DEGRADED (10-25m)',
+      bg: 'bg-amber-50 text-amber-800 border-amber-200',
+      border: 'border-amber-300',
+      text: 'text-amber-700',
+    },
+    WEAK_LOST: {
+      label: 'GNSS: WEAK / LOST',
+      bg: 'bg-rose-50 text-rose-800 border-rose-200',
+      border: 'border-rose-300',
+      text: 'text-rose-700',
+    },
+  };
+
+  const currentQuality = gnssQualityStyles[gnssQuality] || gnssQualityStyles.WEAK_LOST;
 
   const scenarioBadges: Record<
     OperationalMatrixScenario,
@@ -97,6 +124,14 @@ const LiveMetricsOverlay: React.FC<{
         </div>
 
         <div className="flex items-center gap-1.5 flex-shrink-0 ml-2">
+          {/* GNSS Quality Badge */}
+          <span
+            className={`text-[10px] font-bold px-1.5 py-0.5 rounded border font-mono ${currentQuality.bg}`}
+            title={`GNSS Quality State: ${gnssQuality}`}
+          >
+            {gnssQuality === 'GOOD' ? 'GNSS: HIGH' : gnssQuality === 'DEGRADED' ? 'GNSS: MED' : 'GNSS: LOST'}
+          </span>
+
           {/* Tile Cache Badge */}
           <div
             className="flex items-center gap-1 text-[10px] font-bold px-2 py-0.5 rounded bg-slate-900 text-white font-mono"
@@ -236,6 +271,7 @@ export const NavigationHudPage: React.FC = () => {
     routeState,
     telemetry,
     sensorStatus,
+    settings,
     showToast,
     recordSessionPoint,
     stopTrackingSession,
@@ -266,7 +302,7 @@ export const NavigationHudPage: React.FC = () => {
   const prevVehiclePosRef = useRef<[number, number] | null>(null);
   const currentVehiclePosRef = useRef<[number, number] | null>(currentVehiclePos);
   const accumulatedDriftRef = useRef<number>(0);
-  const lastGnssFixTimeRef = useRef<number>(Date.now());
+  const lastGnssFixTimeRef = useRef<number>(0);
 
   useEffect(() => {
     currentVehiclePosRef.current = currentVehiclePos;
@@ -288,6 +324,13 @@ export const NavigationHudPage: React.FC = () => {
 
       if (currentLocation.bearing !== null) {
         gnssTrackHeadingRef.current = currentLocation.bearing;
+      }
+
+      if (settings.fusionMode === 'ekf') {
+        const adaptedGnss = fusionAdapter.adaptGnss(currentLocation);
+        if (adaptedGnss) {
+          fusionAdapter.getRuntime().handleGnssUpdate(adaptedGnss);
+        }
       }
 
       recordSessionPoint({
@@ -312,7 +355,7 @@ export const NavigationHudPage: React.FC = () => {
         setRemainingKm(Math.round(dist * 10) / 10);
       }
     }
-  }, [currentLocation, recordSessionPoint, routeState.destCoords, routeState.routeCoordinates, liveHeading, telemetry.speed]);
+  }, [currentLocation, recordSessionPoint, routeState.destCoords, routeState.routeCoordinates, liveHeading, telemetry.speed, settings.fusionMode]);
 
   // 1. Hardware Sensor Listeners for Compass & Gyroscope Fusion
   useEffect(() => {
@@ -332,24 +375,58 @@ export const NavigationHudPage: React.FC = () => {
       const prevPos = prevVehiclePosRef.current;
       const currPos = currentVehiclePosRef.current;
 
-      let trajBearing: number | null = null;
-      if (prevPos && currPos) {
-        const dist = DeadReckoningEngine.calculateHaversineDistance(prevPos, currPos);
-        if (dist > 0.0005) {
-          trajBearing = OrientationService.calculateBearing(prevPos, currPos);
+      let fused = prevHeading;
+      let drStepPos = currPos;
+      let drStepSpeed = telemetry.speed || 0;
+      let drStepDrift = accumulatedDriftRef.current;
+
+      if (settings.fusionMode === 'ekf') {
+        const drEstimate = fusionAdapter.step(
+          realSensors,
+          isGnssLocked ? currentLocation : null
+        );
+        fused = drEstimate.headingDeg;
+        drStepPos = drEstimate.position;
+        drStepSpeed = drEstimate.velocitySpeedKmH;
+        drStepDrift = drEstimate.driftErrorMeters;
+      } else {
+        let trajBearing: number | null = null;
+        if (prevPos && currPos) {
+          const dist = DeadReckoningEngine.calculateHaversineDistance(prevPos, currPos);
+          if (dist > 0.0005) {
+            trajBearing = OrientationService.calculateBearing(prevPos, currPos);
+          }
+        }
+
+        fused = OrientationService.fuseHeading({
+          magnetometerHeading: magnetometerHeadingRef.current,
+          gnssTrackBearing: gnssTrackHeadingRef.current,
+          trajectoryBearing: trajBearing,
+          gyroZRate: gyroZRateRef.current,
+          speedKmH: telemetry.speed || 0,
+          isGnssAvailable: isGnssLocked,
+          deltaTimeSec: dt,
+          previousHeading: prevHeading,
+        });
+
+        if (currPos) {
+          const accelMag = Math.sqrt(
+            telemetry.ax * telemetry.ax +
+            telemetry.ay * telemetry.ay
+          );
+          const legacyDrStep = DeadReckoningEngine.stepKinematics(
+            currPos,
+            telemetry.speed || 0,
+            accelMag,
+            fused,
+            dt,
+            accumulatedDriftRef.current
+          );
+          drStepPos = legacyDrStep.position;
+          drStepSpeed = legacyDrStep.velocitySpeedKmH;
+          drStepDrift = legacyDrStep.driftErrorMeters;
         }
       }
-
-      const fused = OrientationService.fuseHeading({
-        magnetometerHeading: magnetometerHeadingRef.current,
-        gnssTrackBearing: gnssTrackHeadingRef.current,
-        trajectoryBearing: trajBearing,
-        gyroZRate: gyroZRateRef.current,
-        speedKmH: telemetry.speed || 0,
-        isGnssAvailable: isGnssLocked,
-        deltaTimeSec: dt,
-        previousHeading: prevHeading,
-      });
 
       fusedHeadingRef.current = fused;
       setLiveHeading(fused);
@@ -357,54 +434,39 @@ export const NavigationHudPage: React.FC = () => {
 
       // If GNSS has been lost for > 3 seconds, engage Dead Reckoning kinematic stepping
       const timeSinceLastGnss = Date.now() - lastGnssFixTimeRef.current;
-      if (timeSinceLastGnss > 3000 && currPos) {
+      if (timeSinceLastGnss > 3000 && drStepPos) {
         setIsGnssLocked(false);
 
-        // Execute Dead Reckoning kinematic step with actual sensor linear acceleration
-        const accelMag = Math.sqrt(
-          telemetry.ax * telemetry.ax +
-          telemetry.ay * telemetry.ay
-        );
-
-        const drStep = DeadReckoningEngine.stepKinematics(
-          currPos,
-          telemetry.speed || 0,
-          accelMag,
-          fused,
-          dt,
-          accumulatedDriftRef.current
-        );
-
-        accumulatedDriftRef.current = drStep.driftErrorMeters;
-        setDrDrift(drStep.driftErrorMeters);
-        setCurrentVehiclePos(drStep.position);
-        setDeadReckoningPath((prev) => [...prev.slice(-100), drStep.position]);
+        accumulatedDriftRef.current = drStepDrift;
+        setDrDrift(drStepDrift);
+        setCurrentVehiclePos(drStepPos);
+        setDeadReckoningPath((prev) => [...prev.slice(-100), drStepPos!]);
 
         // Record DR point to session
         recordSessionPoint({
           timestamp: Date.now(),
-          lat: drStep.position[0],
-          lng: drStep.position[1],
-          speedKmH: drStep.velocitySpeedKmH,
+          lat: drStepPos[0],
+          lng: drStepPos[1],
+          speedKmH: drStepSpeed,
           headingDeg: fused,
           isDeadReckoning: true,
         });
 
         if (routeState.routeCoordinates && routeState.routeCoordinates.length > 0) {
           const { remainingDistanceKm } = calculateRemainingRoadDistance(
-            drStep.position,
+            drStepPos,
             routeState.routeCoordinates
           );
           setRemainingKm(remainingDistanceKm);
         } else if (routeState.destCoords) {
-          const dist = DeadReckoningEngine.calculateHaversineDistance(drStep.position, routeState.destCoords);
+          const dist = DeadReckoningEngine.calculateHaversineDistance(drStepPos, routeState.destCoords);
           setRemainingKm(Math.round(dist * 10) / 10);
         }
       }
     }, 100);
 
     return () => clearInterval(intervalId);
-  }, [telemetry.speed, telemetry.ax, telemetry.ay, isGnssLocked, routeState.destCoords, routeState.routeCoordinates, recordSessionPoint]);
+  }, [telemetry.speed, telemetry.ax, telemetry.ay, isGnssLocked, routeState.destCoords, routeState.routeCoordinates, recordSessionPoint, settings.fusionMode, realSensors, currentLocation]);
 
   const handleEndNavigation = () => {
     stopTrackingSession();

@@ -64,6 +64,41 @@ export const ProfilePage: React.FC = () => {
 
           {/* Settings List Card */}
           <div className="bg-white border border-slate-200 rounded-md divide-y divide-slate-100 shadow-xs">
+            {/* Setting: Sensor Fusion Engine Mode */}
+            <div className="p-3.5 flex items-center justify-between">
+              <div>
+                <div className="text-xs font-bold text-slate-900 flex items-center gap-1.5">
+                  <span>Dead Reckoning & Fusion Engine</span>
+                  <span className="text-[10px] font-bold px-1.5 py-0.2 rounded bg-amber-50 text-amber-700 border border-amber-200">
+                    A/B Test
+                  </span>
+                </div>
+                <div className="text-[11px] text-slate-500">
+                  {settings.fusionMode === 'ekf'
+                    ? '15-State Error-State EKF + ZUPT (IDR_PRO)'
+                    : 'Legacy Kinematic Stepping + Heading Filter'}
+                </div>
+              </div>
+              <div className="flex bg-slate-100 p-0.5 rounded border border-slate-200">
+                <button
+                  onClick={() => updateSettingValue('fusionMode', 'ekf')}
+                  className={`px-2 py-1 text-[11px] font-bold rounded cursor-pointer ${
+                    settings.fusionMode === 'ekf' ? 'bg-blue-700 text-white shadow-xs' : 'text-slate-600'
+                  }`}
+                >
+                  EKF
+                </button>
+                <button
+                  onClick={() => updateSettingValue('fusionMode', 'legacy')}
+                  className={`px-2 py-1 text-[11px] font-bold rounded cursor-pointer ${
+                    settings.fusionMode === 'legacy' ? 'bg-blue-700 text-white shadow-xs' : 'text-slate-600'
+                  }`}
+                >
+                  Legacy
+                </button>
+              </div>
+            </div>
+
             {/* Setting 1: High-speed sensor reading */}
             <div className="p-3.5 flex items-center justify-between">
               <div>
