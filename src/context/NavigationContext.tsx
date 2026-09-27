@@ -35,7 +35,7 @@ const defaultSettings: SettingsState = {
   speedUnit: 'km/h',
   distanceUnit: 'km',
   offlineLogs: '0 KB',
-  fusionMode: 'legacy',
+  fusionMode: 'ekf',
 };
 
 function loadStoredSettings(): SettingsState {

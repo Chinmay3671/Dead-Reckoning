@@ -124,6 +124,18 @@ const LiveMetricsOverlay: React.FC<{
         </div>
 
         <div className="flex items-center gap-1.5 flex-shrink-0 ml-2">
+          {/* Fusion Engine Mode Badge */}
+          <span
+            className={`text-[10px] font-bold px-1.5 py-0.5 rounded border font-mono ${
+              settings.fusionMode === 'ekf'
+                ? 'bg-blue-50 text-blue-700 border-blue-300'
+                : 'bg-slate-100 text-slate-700 border-slate-300'
+            }`}
+            title={`Active Dead Reckoning Fusion Engine: ${settings.fusionMode.toUpperCase()}`}
+          >
+            {settings.fusionMode === 'ekf' ? 'EKF 15-STATE' : 'LEGACY DR'}
+          </span>
+
           {/* GNSS Quality Badge */}
           <span
             className={`text-[10px] font-bold px-1.5 py-0.5 rounded border font-mono ${currentQuality.bg}`}
